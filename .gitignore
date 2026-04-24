@@ -1,0 +1,45 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local Python tooling
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Streamlit and app runtime output
+*.log
+logs/
+tmp/
+temp/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Docker Compose local overrides
+docker-compose.override.yml
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
+.codex
+.idea/
+.vscode/
+*.swp
+*.swo
