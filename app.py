@@ -17,17 +17,35 @@ if str(ROOT) not in sys.path:
 
 from tools.dashboard import (  # noqa: E402
     PRODUCT_COLUMN,
+    SMILE_FIT_METHODS,
     add_rolling_z_scores,
+    build_option_pnl_attribution,
+    build_options_analytics,
     build_fill_report,
     build_normalized_mid_series,
     build_pair_spreads,
+    build_portfolio_greeks,
     decompose_pnl,
+    default_option_expiry_day,
+    evenly_spaced_values,
+    fit_volatility_surface,
+    infer_option_chain,
+    infer_underlying_product,
     parse_backtest_text,
+    plot_bs_price_scatter,
+    plot_greek_time_series,
+    plot_hedge_error,
     plot_indicators,
+    plot_iv_residuals,
+    plot_iv_time_series,
     plot_normalized_mid,
     plot_orderbook,
+    plot_option_pnl_attribution,
     plot_pair_spreads,
     plot_pnl,
+    plot_portfolio_greeks,
+    plot_smile_drift,
+    plot_smile_snapshot,
     plot_spreads,
     plot_z_scores,
     prepare_indicator_labels,
@@ -129,6 +147,45 @@ def render_dashboard(parsed) -> None:
         st.warning("Select at least one product.")
         return
 
+    option_chain = infer_option_chain(products)
+    option_products: list[str] = []
+    underlying_product: str | None = None
+    option_expiry_day = float(default_option_expiry_day(activities))
+    delta_rebalance_threshold = 20.0
+    if not option_chain.empty:
+        available_options = sorted(option_chain["product"].unique())
+        default_options = [product for product in available_options if product in selected_products] or available_options
+        with st.sidebar:
+            st.subheader("Options Analytics")
+            option_products = st.multiselect("Voucher products", available_options, default=default_options)
+            underlying_choices = sorted(products)
+            inferred_underlying = infer_underlying_product(products, option_products)
+            underlying_index = (
+                underlying_choices.index(inferred_underlying)
+                if inferred_underlying in underlying_choices
+                else 0
+            )
+            underlying_product = st.selectbox("Underlying product", underlying_choices, index=underlying_index)
+            option_expiry_day = st.number_input(
+                "Option expiry day",
+                min_value=0.0,
+                value=option_expiry_day,
+                step=1.0,
+            )
+            delta_rebalance_threshold = st.number_input(
+                "Delta rebalance threshold",
+                min_value=0.0,
+                value=delta_rebalance_threshold,
+                step=1.0,
+            )
+
+    options_analytics = build_options_analytics(
+        activities,
+        option_products,
+        underlying_product,
+        option_expiry_day,
+    )
+
     latest_total_pnl = activities.sort_values("timestamp").groupby(PRODUCT_COLUMN).tail(1)["profit_and_loss"].sum()
     own_fill_count = int(trades["is_own_trade"].sum()) if not trades.empty else 0
 
@@ -138,8 +195,8 @@ def render_dashboard(parsed) -> None:
     metric_columns[2].metric("Own fills", f"{own_fill_count:,}")
     metric_columns[3].metric("Indicators", f"{len(indicators):,}")
 
-    tab_market, tab_pnl, tab_fills, tab_indicators, tab_logs, tab_raw = st.tabs(
-        ["Market", "PnL", "Fill Rate", "Indicators", "Logs", "Raw Data"]
+    tab_market, tab_volatility, tab_greeks, tab_pnl, tab_fills, tab_indicators, tab_logs, tab_raw = st.tabs(
+        ["Market", "Volatility Surface", "Greeks", "PnL", "Fill Rate", "Indicators", "Logs", "Raw Data"]
     )
 
     with tab_market:
@@ -165,6 +222,62 @@ def render_dashboard(parsed) -> None:
             if selected_pairs:
                 st.plotly_chart(plot_pair_spreads(pair_spreads, selected_pairs), use_container_width=True)
 
+    with tab_volatility:
+        if option_chain.empty:
+            st.info("No voucher/option products detected. Expected names containing VOUCHER or OPTION with a trailing strike.")
+        elif options_analytics.empty:
+            st.warning("Select voucher products and a matching underlying to build volatility analytics.")
+        else:
+            fit_method = st.selectbox("Smile fit", SMILE_FIT_METHODS)
+            fitted_options = fit_volatility_surface(options_analytics, fit_method)
+            st.plotly_chart(plot_iv_time_series(fitted_options), use_container_width=True)
+
+            option_times = sorted(fitted_options["plot_time"].dropna().unique())
+            if option_times:
+                default_smile_time = min(
+                    option_times,
+                    key=lambda value: abs(float(value) - float(selected_timestamp or value)),
+                )
+                smile_time = st.select_slider(
+                    "Smile timestamp",
+                    options=option_times,
+                    value=default_smile_time,
+                )
+                st.plotly_chart(
+                    plot_smile_snapshot(fitted_options, smile_time, fit_method),
+                    use_container_width=True,
+                )
+
+                drift_defaults = evenly_spaced_values(option_times, 5)
+                drift_times = st.multiselect(
+                    "Smile drift timestamps",
+                    option_times,
+                    default=drift_defaults,
+                )
+                if drift_times:
+                    st.plotly_chart(plot_smile_drift(fitted_options, drift_times), use_container_width=True)
+
+            st.plotly_chart(plot_bs_price_scatter(fitted_options), use_container_width=True)
+            st.plotly_chart(plot_iv_residuals(fitted_options), use_container_width=True)
+
+    with tab_greeks:
+        if options_analytics.empty:
+            st.info("No option Greek series available for the current voucher/underlying selection.")
+        else:
+            for greek in ["delta", "gamma", "vega", "theta"]:
+                st.plotly_chart(plot_greek_time_series(options_analytics, greek), use_container_width=True)
+
+            portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
+            if portfolio_greeks.empty:
+                st.info("No portfolio Greek exposure available. Own-trade history may be empty.")
+            else:
+                st.plotly_chart(plot_portfolio_greeks(portfolio_greeks), use_container_width=True)
+                st.plotly_chart(
+                    plot_hedge_error(portfolio_greeks, delta_rebalance_threshold),
+                    use_container_width=True,
+                )
+                st.dataframe(portfolio_greeks.tail(25), use_container_width=True, hide_index=True)
+
     with tab_pnl:
         st.plotly_chart(plot_pnl(activities, selected_products), use_container_width=True)
         st.dataframe(
@@ -172,6 +285,20 @@ def render_dashboard(parsed) -> None:
             use_container_width=True,
             hide_index=True,
         )
+        option_attribution = build_option_pnl_attribution(
+            activities,
+            trades,
+            options_analytics,
+            underlying_product,
+        )
+        if not option_attribution.empty:
+            st.subheader("Options PnL Attribution")
+            st.plotly_chart(plot_option_pnl_attribution(option_attribution), use_container_width=True)
+            st.dataframe(option_attribution, use_container_width=True, hide_index=True)
+            st.caption(
+                "Options attribution assumes call vouchers, flat opening inventory, and hedge PnL allocated to the "
+                "selected underlying leg. Theta decay uses annualized BS theta times elapsed TTE."
+            )
 
     with tab_fills:
         fill_report = build_fill_report(parsed, selected_products)

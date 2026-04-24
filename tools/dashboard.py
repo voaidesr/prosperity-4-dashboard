@@ -53,6 +53,9 @@ def cache_data(*args, **kwargs):
 LOG_DIR = Path("backtests")
 PRODUCT_COLUMN = "product"
 SUBMISSION = "SUBMISSION"
+DEFAULT_TICKS_PER_DAY = 1_000_000
+DEFAULT_DAYS_PER_YEAR = 365
+SMILE_FIT_METHODS = ["quadratic", "cubic", "rolling mean per strike"]
 
 
 @dataclass(frozen=True)
@@ -476,6 +479,629 @@ def prepare_indicator_labels(indicators: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
+def infer_option_chain(products: Iterable[str]) -> pd.DataFrame:
+    """Infer voucher/option products, strikes, and likely underlyings from names."""
+
+    product_list = sorted(str(product) for product in products if pd.notna(product))
+    product_set = set(product_list)
+    rows: list[dict[str, object]] = []
+    for product in product_list:
+        upper = product.upper()
+        if "VOUCHER" not in upper and "OPTION" not in upper:
+            continue
+        strike_match = re.search(r"(\d+(?:\.\d+)?)$", product)
+        if not strike_match:
+            continue
+
+        strike = float(strike_match.group(1))
+        prefix = re.sub(r"_?(?:VOUCHER|OPTION|CALL|PUT).*", "", product, flags=re.IGNORECASE).strip("_")
+        underlying_candidates = [candidate for candidate in product_set if candidate != product and product.startswith(candidate)]
+        underlying = prefix if prefix in product_set else ""
+        if not underlying and underlying_candidates:
+            underlying = max(underlying_candidates, key=len)
+        rows.append({"product": product, "strike": strike, "underlying": underlying})
+
+    return pd.DataFrame(rows, columns=["product", "strike", "underlying"])
+
+
+def infer_underlying_product(products: Iterable[str], option_products: Iterable[str] | None = None) -> str | None:
+    """Return the best default underlying for a detected option chain."""
+
+    product_list = sorted(str(product) for product in products if pd.notna(product))
+    option_set = set(option_products or [])
+    chain = infer_option_chain(product_list)
+    if option_set:
+        chain = chain[chain["product"].isin(option_set)]
+    candidates = [candidate for candidate in chain["underlying"].dropna().unique() if candidate in product_list]
+    if candidates:
+        return sorted(candidates, key=lambda value: (-len(value), value))[0]
+
+    non_options = [product for product in product_list if product not in set(chain["product"])]
+    return non_options[0] if non_options else None
+
+
+def default_option_expiry_day(activities: pd.DataFrame) -> int:
+    """Choose a conservative default expiry day for voucher analytics controls."""
+
+    if activities.empty or "day" not in activities:
+        return 7
+    max_day = pd.to_numeric(activities["day"], errors="coerce").max()
+    if not np.isfinite(max_day):
+        return 7
+    return max(7, int(np.floor(max_day)) + 1)
+
+
+def _time_keys(frame: pd.DataFrame) -> list[str]:
+    """Return timestamp keys present in a frame."""
+
+    return ["day", "timestamp"] if "day" in frame.columns and frame["day"].notna().any() else ["timestamp"]
+
+
+def _add_plot_time(frame: pd.DataFrame, ticks_per_day: int = DEFAULT_TICKS_PER_DAY) -> pd.DataFrame:
+    """Add a monotonic timestamp for cross-day plots."""
+
+    output = frame.copy()
+    if "day" in output.columns:
+        output["plot_time"] = output["day"].astype(float) * ticks_per_day + output["timestamp"].astype(float)
+    else:
+        output["plot_time"] = output["timestamp"].astype(float)
+    return output
+
+
+def _calculate_tte_years(
+    frame: pd.DataFrame,
+    expiry_day: float,
+    ticks_per_day: int = DEFAULT_TICKS_PER_DAY,
+    days_per_year: int = DEFAULT_DAYS_PER_YEAR,
+) -> pd.Series:
+    """Calculate option time-to-expiry in years from Prosperity day/timestamp fields."""
+
+    day = pd.to_numeric(frame["day"], errors="coerce") if "day" in frame.columns else 0.0
+    timestamp = pd.to_numeric(frame["timestamp"], errors="coerce").fillna(0.0)
+    current_day = day + timestamp / ticks_per_day
+    days_to_expiry = expiry_day - current_day
+    tte = days_to_expiry / days_per_year
+    return tte.where(tte > 0)
+
+
+def _normal_pdf(x: np.ndarray | pd.Series | float) -> np.ndarray:
+    values = np.asarray(x, dtype=float)
+    return np.exp(-0.5 * values * values) / np.sqrt(2 * np.pi)
+
+
+def _normal_cdf(x: np.ndarray | pd.Series | float) -> np.ndarray:
+    """Vectorized normal CDF approximation without a SciPy dependency."""
+
+    values = np.asarray(x, dtype=float)
+    z = np.abs(values)
+    t = 1.0 / (1.0 + 0.2316419 * z)
+    poly = t * (
+        0.319381530
+        + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))
+    )
+    cdf = 1.0 - _normal_pdf(z) * poly
+    return np.where(values >= 0, cdf, 1.0 - cdf)
+
+
+def _bs_d1_d2(
+    spot: np.ndarray | pd.Series | float,
+    strike: np.ndarray | pd.Series | float,
+    tte: np.ndarray | pd.Series | float,
+    volatility: np.ndarray | pd.Series | float,
+) -> tuple[np.ndarray, np.ndarray]:
+    spot_values = np.asarray(spot, dtype=float)
+    strike_values = np.asarray(strike, dtype=float)
+    tte_values = np.asarray(tte, dtype=float)
+    vol_values = np.asarray(volatility, dtype=float)
+    denominator = vol_values * np.sqrt(tte_values)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d1 = (np.log(spot_values / strike_values) + 0.5 * vol_values * vol_values * tte_values) / denominator
+    d2 = d1 - denominator
+    return d1, d2
+
+
+def black_scholes_call_price(
+    spot: np.ndarray | pd.Series | float,
+    strike: np.ndarray | pd.Series | float,
+    tte: np.ndarray | pd.Series | float,
+    volatility: np.ndarray | pd.Series | float,
+) -> np.ndarray:
+    """Return zero-rate Black-Scholes call prices."""
+
+    spot_values = np.asarray(spot, dtype=float)
+    strike_values = np.asarray(strike, dtype=float)
+    tte_values = np.asarray(tte, dtype=float)
+    vol_values = np.asarray(volatility, dtype=float)
+    intrinsic = np.maximum(spot_values - strike_values, 0.0)
+    valid = (spot_values > 0) & (strike_values > 0) & (tte_values > 0) & (vol_values > 0)
+    prices = np.full(np.broadcast(spot_values, strike_values, tte_values, vol_values).shape, np.nan)
+    if not np.any(valid):
+        return np.where((tte_values <= 0) | (vol_values <= 0), intrinsic, prices)
+
+    d1, d2 = _bs_d1_d2(spot_values, strike_values, tte_values, vol_values)
+    model = spot_values * _normal_cdf(d1) - strike_values * _normal_cdf(d2)
+    prices = np.where(valid, model, prices)
+    return np.where((tte_values <= 0) | (vol_values <= 0), intrinsic, prices)
+
+
+def black_scholes_call_greeks(
+    spot: np.ndarray | pd.Series | float,
+    strike: np.ndarray | pd.Series | float,
+    tte: np.ndarray | pd.Series | float,
+    volatility: np.ndarray | pd.Series | float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return delta, gamma, vega, and annualized theta for zero-rate calls."""
+
+    spot_values = np.asarray(spot, dtype=float)
+    strike_values = np.asarray(strike, dtype=float)
+    tte_values = np.asarray(tte, dtype=float)
+    vol_values = np.asarray(volatility, dtype=float)
+    valid = (spot_values > 0) & (strike_values > 0) & (tte_values > 0) & (vol_values > 0)
+    d1, _ = _bs_d1_d2(spot_values, strike_values, tte_values, vol_values)
+    pdf = _normal_pdf(d1)
+    sqrt_tte = np.sqrt(tte_values)
+
+    delta = np.where(valid, _normal_cdf(d1), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gamma = np.where(valid, pdf / (spot_values * vol_values * sqrt_tte), np.nan)
+        vega = np.where(valid, spot_values * pdf * sqrt_tte, np.nan)
+        theta = np.where(valid, -(spot_values * pdf * vol_values) / (2.0 * sqrt_tte), np.nan)
+    return delta, gamma, vega, theta
+
+
+def implied_volatility_call(
+    market_price: np.ndarray | pd.Series,
+    spot: np.ndarray | pd.Series,
+    strike: np.ndarray | pd.Series,
+    tte: np.ndarray | pd.Series,
+    max_volatility: float = 5.0,
+    iterations: int = 60,
+) -> np.ndarray:
+    """Solve zero-rate call IV with vectorized bisection."""
+
+    prices = np.asarray(market_price, dtype=float)
+    spot_values = np.asarray(spot, dtype=float)
+    strike_values = np.asarray(strike, dtype=float)
+    tte_values = np.asarray(tte, dtype=float)
+    intrinsic = np.maximum(spot_values - strike_values, 0.0)
+    valid = (
+        np.isfinite(prices)
+        & np.isfinite(spot_values)
+        & np.isfinite(strike_values)
+        & np.isfinite(tte_values)
+        & (prices > 0)
+        & (spot_values > 0)
+        & (strike_values > 0)
+        & (tte_values > 0)
+        & (prices >= intrinsic - 1e-6)
+        & (prices <= spot_values + 1e-6)
+    )
+    iv = np.full(prices.shape, np.nan)
+    if not np.any(valid):
+        return iv
+
+    low = np.full(prices.shape, 1e-6)
+    high = np.full(prices.shape, max_volatility)
+    target = np.maximum(prices, intrinsic + 1e-9)
+    for _ in range(iterations):
+        mid = (low + high) / 2.0
+        model = black_scholes_call_price(spot_values, strike_values, tte_values, mid)
+        low = np.where(valid & (model < target), mid, low)
+        high = np.where(valid & (model >= target), mid, high)
+    iv[valid] = (low[valid] + high[valid]) / 2.0
+    return iv
+
+
+def build_options_analytics(
+    activities: pd.DataFrame,
+    option_products: list[str],
+    underlying_product: str | None,
+    expiry_day: float,
+    ticks_per_day: int = DEFAULT_TICKS_PER_DAY,
+    days_per_year: int = DEFAULT_DAYS_PER_YEAR,
+) -> pd.DataFrame:
+    """Build IV, moneyness, theoretical price, and Greek series for vouchers."""
+
+    columns = [
+        "day",
+        "timestamp",
+        "plot_time",
+        "product",
+        "strike",
+        "strike_label",
+        "underlying_product",
+        "underlying_price",
+        "market_price",
+        "tte",
+        "moneyness",
+        "market_iv",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+    ]
+    if activities.empty or not option_products or underlying_product is None:
+        return pd.DataFrame(columns=columns)
+
+    chain = infer_option_chain(activities[PRODUCT_COLUMN].dropna().unique())
+    chain = chain[chain["product"].isin(option_products)]
+    if chain.empty:
+        return pd.DataFrame(columns=columns)
+
+    time_keys = _time_keys(activities)
+    option_rows = activities[activities[PRODUCT_COLUMN].isin(chain["product"])].copy()
+    underlying_rows = activities[activities[PRODUCT_COLUMN].eq(underlying_product)].copy()
+    if option_rows.empty or underlying_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    strike_by_product = chain.set_index("product")["strike"]
+    option_rows["strike"] = option_rows[PRODUCT_COLUMN].map(strike_by_product)
+    option_keep = time_keys + [PRODUCT_COLUMN, "strike", "mid_price"]
+    option_rows = option_rows[option_keep].rename(
+        columns={PRODUCT_COLUMN: "product", "mid_price": "market_price"}
+    )
+    underlying_rows = underlying_rows[time_keys + ["mid_price"]].rename(columns={"mid_price": "underlying_price"})
+
+    merged = option_rows.merge(underlying_rows, on=time_keys, how="left")
+    merged["underlying_product"] = underlying_product
+    merged = _add_plot_time(merged, ticks_per_day)
+    merged["tte"] = _calculate_tte_years(merged, expiry_day, ticks_per_day, days_per_year)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        merged["moneyness"] = np.log(merged["strike"] / merged["underlying_price"]) / np.sqrt(merged["tte"])
+    merged["market_iv"] = implied_volatility_call(
+        merged["market_price"],
+        merged["underlying_price"],
+        merged["strike"],
+        merged["tte"],
+    )
+    delta, gamma, vega, theta = black_scholes_call_greeks(
+        merged["underlying_price"],
+        merged["strike"],
+        merged["tte"],
+        merged["market_iv"],
+    )
+    merged["delta"] = delta
+    merged["gamma"] = gamma
+    merged["vega"] = vega
+    merged["theta"] = theta
+    merged["strike_label"] = "K=" + merged["strike"].map(lambda value: f"{value:g}")
+    for column in columns:
+        if column not in merged:
+            merged[column] = np.nan
+    return merged[columns].sort_values(["product", "plot_time"])
+
+
+def _fit_method_key(method: str) -> str:
+    return method.strip().lower().replace(" ", "_")
+
+
+def fit_volatility_surface(
+    options: pd.DataFrame,
+    method: str,
+    rolling_window: int = 20,
+) -> pd.DataFrame:
+    """Add fitted IV, theoretical BS price, and residual columns."""
+
+    output = options.copy()
+    output["fitted_iv"] = np.nan
+    method_key = _fit_method_key(method)
+    valid = output["market_iv"].notna() & output["moneyness"].notna()
+
+    if output.empty or not valid.any():
+        output["theoretical_price"] = np.nan
+        output["iv_residual"] = np.nan
+        return output
+
+    if method_key in {"quadratic", "cubic"}:
+        degree = 2 if method_key == "quadratic" else 3
+        group_keys = _time_keys(output)
+        for _, group in output[valid].groupby(group_keys):
+            x = group["moneyness"].to_numpy(dtype=float)
+            y = group["market_iv"].to_numpy(dtype=float)
+            finite = np.isfinite(x) & np.isfinite(y)
+            unique_x = np.unique(x[finite])
+            if len(unique_x) >= degree + 1 and finite.sum() >= degree + 1:
+                coefficients = np.polyfit(x[finite], y[finite], degree)
+                output.loc[group.index[finite], "fitted_iv"] = np.polyval(coefficients, x[finite])
+            elif finite.any():
+                output.loc[group.index[finite], "fitted_iv"] = np.nanmean(y[finite])
+    else:
+        sorted_output = output.sort_values(["product", "plot_time"]).copy()
+        sorted_output["fitted_iv"] = sorted_output.groupby("product")["market_iv"].transform(
+            lambda series: series.rolling(rolling_window, min_periods=1).mean()
+        )
+        output.loc[sorted_output.index, "fitted_iv"] = sorted_output["fitted_iv"]
+
+    output["fitted_iv"] = output["fitted_iv"].where(output["fitted_iv"] > 0)
+    output["theoretical_price"] = black_scholes_call_price(
+        output["underlying_price"],
+        output["strike"],
+        output["tte"],
+        output["fitted_iv"],
+    )
+    output["iv_residual"] = output["market_iv"] - output["fitted_iv"]
+    return output
+
+
+def evenly_spaced_values(values: Iterable[float | int], count: int) -> list[float | int]:
+    """Pick up to count evenly spaced values from a sorted sequence."""
+
+    ordered = list(values)
+    if len(ordered) <= count:
+        return ordered
+    indices = np.linspace(0, len(ordered) - 1, count, dtype=int)
+    return [ordered[index] for index in indices]
+
+
+def build_position_series(activities: pd.DataFrame, trades: pd.DataFrame, products: list[str]) -> pd.DataFrame:
+    """Estimate product positions and inventory PnL from own fills and mids."""
+
+    columns = [
+        "day",
+        "timestamp",
+        "plot_time",
+        "product",
+        "mid_price",
+        "trade_flow",
+        "position",
+        "prev_position",
+        "inventory_pnl",
+    ]
+    if activities.empty or not products:
+        return pd.DataFrame(columns=columns)
+
+    time_keys = _time_keys(activities)
+    grid = activities[activities[PRODUCT_COLUMN].isin(products)][time_keys + [PRODUCT_COLUMN, "mid_price"]].copy()
+    grid = grid.rename(columns={PRODUCT_COLUMN: "product"})
+    if grid.empty:
+        return pd.DataFrame(columns=columns)
+
+    if trades.empty:
+        flows = pd.DataFrame(columns=["timestamp", "product", "trade_flow"])
+    else:
+        own = trades[trades["is_own_trade"] & trades["symbol"].isin(products)].copy()
+        flows = (
+            own.groupby(["timestamp", "symbol"], as_index=False)["signed_quantity"].sum()
+            if not own.empty
+            else pd.DataFrame(columns=["timestamp", "symbol", "signed_quantity"])
+        )
+        flows = flows.rename(columns={"symbol": "product", "signed_quantity": "trade_flow"})
+
+    grid = grid.merge(flows, on=["timestamp", "product"], how="left")
+    grid["trade_flow"] = grid["trade_flow"].fillna(0.0)
+    grid = _add_plot_time(grid).sort_values(["product", "plot_time"])
+    grid["position"] = grid.groupby("product")["trade_flow"].cumsum()
+    grid["prev_position"] = grid.groupby("product")["position"].shift(1).fillna(0.0)
+    price_change = grid.groupby("product")["mid_price"].diff().fillna(0.0)
+    grid["inventory_pnl"] = grid["prev_position"] * price_change
+    for column in columns:
+        if column not in grid:
+            grid[column] = np.nan
+    return grid[columns]
+
+
+def calculate_spread_capture_pnl(
+    activities: pd.DataFrame,
+    trades: pd.DataFrame,
+    products: list[str],
+) -> pd.DataFrame:
+    """Estimate fill edge against contemporaneous product mid."""
+
+    columns = ["product", "spread_capture_pnl", "own_fill_volume", "avg_fill_edge"]
+    if activities.empty or trades.empty or not products:
+        return pd.DataFrame(columns=columns)
+
+    own = trades[trades["is_own_trade"] & trades["symbol"].isin(products)].copy()
+    if own.empty:
+        return pd.DataFrame(columns=columns)
+
+    mids = activities[["timestamp", PRODUCT_COLUMN, "mid_price"]].rename(columns={PRODUCT_COLUMN: "symbol"})
+    own = own.merge(mids, on=["timestamp", "symbol"], how="left")
+    own["fill_edge"] = np.select(
+        [own["side"] == "BUY", own["side"] == "SELL"],
+        [own["mid_price"] - own["price"], own["price"] - own["mid_price"]],
+        default=0.0,
+    )
+    own["edge_pnl"] = own["fill_edge"] * own["quantity"]
+    return (
+        own.groupby("symbol", as_index=False)
+        .agg(
+            spread_capture_pnl=("edge_pnl", "sum"),
+            own_fill_volume=("quantity", "sum"),
+            avg_fill_edge=("fill_edge", "mean"),
+        )
+        .rename(columns={"symbol": "product"})
+    )
+
+
+def build_portfolio_greeks(
+    activities: pd.DataFrame,
+    options: pd.DataFrame,
+    trades: pd.DataFrame,
+    underlying_product: str | None,
+) -> pd.DataFrame:
+    """Aggregate option Greeks and underlying inventory into portfolio exposures."""
+
+    columns = [
+        "day",
+        "timestamp",
+        "plot_time",
+        "option_delta",
+        "underlying_position",
+        "portfolio_delta",
+        "portfolio_gamma",
+        "portfolio_vega",
+        "portfolio_theta",
+        "abs_portfolio_delta",
+    ]
+    if activities.empty or options.empty or underlying_product is None:
+        return pd.DataFrame(columns=columns)
+
+    option_products = sorted(options["product"].dropna().unique())
+    products = option_products + [underlying_product]
+    positions = build_position_series(activities, trades, products)
+    if positions.empty:
+        return pd.DataFrame(columns=columns)
+
+    merge_keys = [key for key in [*_time_keys(options), "product"] if key in positions.columns]
+    option_positions = options.merge(
+        positions[merge_keys + ["position"]],
+        on=merge_keys,
+        how="left",
+    )
+    option_positions["position"] = option_positions["position"].fillna(0.0)
+    option_positions["delta_exposure"] = option_positions["position"] * option_positions["delta"]
+    option_positions["gamma_exposure"] = option_positions["position"] * option_positions["gamma"]
+    option_positions["vega_exposure"] = option_positions["position"] * option_positions["vega"]
+    option_positions["theta_exposure"] = option_positions["position"] * option_positions["theta"]
+
+    group_keys = [key for key in [*_time_keys(option_positions), "plot_time"] if key in option_positions.columns]
+    portfolio = (
+        option_positions.groupby(group_keys, as_index=False)
+        .agg(
+            option_delta=("delta_exposure", "sum"),
+            portfolio_gamma=("gamma_exposure", "sum"),
+            portfolio_vega=("vega_exposure", "sum"),
+            portfolio_theta=("theta_exposure", "sum"),
+        )
+        .sort_values("plot_time")
+    )
+
+    underlying = positions[positions["product"].eq(underlying_product)][
+        [key for key in ["day", "timestamp", "plot_time", "position"] if key in positions.columns]
+    ].rename(columns={"position": "underlying_position"})
+    merge_time_keys = [key for key in [*_time_keys(portfolio), "plot_time"] if key in underlying.columns]
+    portfolio = portfolio.merge(underlying, on=merge_time_keys, how="left")
+    portfolio["underlying_position"] = portfolio["underlying_position"].fillna(0.0)
+    portfolio["portfolio_delta"] = portfolio["option_delta"] + portfolio["underlying_position"]
+    portfolio["abs_portfolio_delta"] = portfolio["portfolio_delta"].abs()
+    for column in columns:
+        if column not in portfolio:
+            portfolio[column] = np.nan
+    return portfolio[columns]
+
+
+def build_option_pnl_attribution(
+    activities: pd.DataFrame,
+    trades: pd.DataFrame,
+    options: pd.DataFrame,
+    underlying_product: str | None,
+) -> pd.DataFrame:
+    """Estimate option-specific PnL attribution by product and hedge leg."""
+
+    columns = [
+        "product",
+        "role",
+        "official_pnl",
+        "inventory_pnl",
+        "spread_capture_pnl",
+        "hedge_pnl",
+        "theta_decay",
+        "residual_pnl_est",
+        "ending_position",
+    ]
+    if activities.empty or options.empty:
+        return pd.DataFrame(columns=columns)
+
+    option_products = sorted(options["product"].dropna().unique())
+    all_products = option_products + ([underlying_product] if underlying_product else [])
+    positions = build_position_series(activities, trades, all_products)
+    spread = calculate_spread_capture_pnl(activities, trades, all_products)
+
+    latest_pnl = (
+        activities[activities[PRODUCT_COLUMN].isin(all_products)]
+        .sort_values("timestamp")
+        .groupby(PRODUCT_COLUMN, as_index=False)
+        .tail(1)[[PRODUCT_COLUMN, "profit_and_loss"]]
+        .rename(columns={PRODUCT_COLUMN: "product", "profit_and_loss": "official_pnl"})
+    )
+    official_by_product = (
+        latest_pnl.set_index("product")["official_pnl"] if not latest_pnl.empty else pd.Series(dtype=float)
+    )
+    inventory_by_product = (
+        positions.groupby("product")["inventory_pnl"].sum() if not positions.empty else pd.Series(dtype=float)
+    )
+    if positions.empty:
+        ending_position_by_product = pd.Series(dtype=float)
+    else:
+        latest_positions = positions.sort_values("plot_time").groupby("product", as_index=False).tail(1)
+        ending_position_by_product = latest_positions.set_index("product")["position"]
+    spread_by_product = spread.set_index("product")["spread_capture_pnl"] if not spread.empty else pd.Series(dtype=float)
+
+    merge_keys = [key for key in [*_time_keys(options), "product"] if key in positions.columns]
+    theta_frame = options.merge(positions[merge_keys + ["position"]], on=merge_keys, how="left")
+    theta_frame["position"] = theta_frame["position"].fillna(0.0)
+    theta_frame = theta_frame.sort_values(["product", "plot_time"])
+    theta_frame["prev_position"] = theta_frame.groupby("product")["position"].shift(1).fillna(0.0)
+    theta_frame["prev_theta"] = theta_frame.groupby("product")["theta"].shift(1)
+    theta_frame["prev_tte"] = theta_frame.groupby("product")["tte"].shift(1)
+    elapsed_years = (theta_frame["prev_tte"] - theta_frame["tte"]).clip(lower=0)
+    theta_frame["theta_decay"] = theta_frame["prev_position"] * theta_frame["prev_theta"] * elapsed_years
+    theta_by_product = theta_frame.groupby("product")["theta_decay"].sum(min_count=1)
+
+    rows: list[dict[str, object]] = []
+    for product in option_products:
+        inventory_pnl = float(inventory_by_product.get(product, 0.0))
+        spread_capture_pnl = float(spread_by_product.get(product, 0.0))
+        theta_decay = (
+            float(theta_by_product.get(product, 0.0)) if pd.notna(theta_by_product.get(product, np.nan)) else 0.0
+        )
+        official_pnl = float(official_by_product.get(product, np.nan))
+        component_sum = inventory_pnl + spread_capture_pnl + theta_decay
+        rows.append(
+            {
+                "product": product,
+                "role": "option",
+                "official_pnl": official_pnl,
+                "inventory_pnl": inventory_pnl,
+                "spread_capture_pnl": spread_capture_pnl,
+                "hedge_pnl": 0.0,
+                "theta_decay": theta_decay,
+                "residual_pnl_est": official_pnl - component_sum if np.isfinite(official_pnl) else np.nan,
+                "ending_position": float(ending_position_by_product.get(product, 0.0)),
+            }
+        )
+
+    if underlying_product:
+        hedge_pnl = float(inventory_by_product.get(underlying_product, 0.0))
+        spread_capture_pnl = float(spread_by_product.get(underlying_product, 0.0))
+        official_pnl = float(official_by_product.get(underlying_product, np.nan))
+        rows.append(
+            {
+                "product": underlying_product,
+                "role": "underlying hedge",
+                "official_pnl": official_pnl,
+                "inventory_pnl": 0.0,
+                "spread_capture_pnl": spread_capture_pnl,
+                "hedge_pnl": hedge_pnl,
+                "theta_decay": 0.0,
+                "residual_pnl_est": official_pnl - spread_capture_pnl - hedge_pnl if np.isfinite(official_pnl) else np.nan,
+                "ending_position": float(ending_position_by_product.get(underlying_product, 0.0)),
+            }
+        )
+
+    output = pd.DataFrame(rows, columns=columns)
+    if output.empty:
+        return output
+    total = {
+        "product": "TOTAL_OPTION_PORTFOLIO",
+        "role": "portfolio",
+        "official_pnl": output["official_pnl"].sum(min_count=1),
+        "inventory_pnl": output["inventory_pnl"].sum(),
+        "spread_capture_pnl": output["spread_capture_pnl"].sum(),
+        "hedge_pnl": output["hedge_pnl"].sum(),
+        "theta_decay": output["theta_decay"].sum(),
+        "ending_position": np.nan,
+    }
+    total_component_sum = (
+        total["inventory_pnl"] + total["spread_capture_pnl"] + total["hedge_pnl"] + total["theta_decay"]
+    )
+    total["residual_pnl_est"] = (
+        total["official_pnl"] - total_component_sum if np.isfinite(total["official_pnl"]) else np.nan
+    )
+    return pd.concat([output, pd.DataFrame([total])], ignore_index=True)[columns]
+
+
 def decompose_pnl(activities: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
     """Estimate per-product PnL decomposition.
 
@@ -758,6 +1384,214 @@ def plot_pnl(activities: pd.DataFrame, products: list[str]) -> go.Figure:
     return fig
 
 
+def plot_iv_time_series(options: pd.DataFrame) -> go.Figure:
+    """Plot market IV over time with one line per strike."""
+
+    subset = options.dropna(subset=["market_iv", "plot_time"])
+    fig = px.line(
+        subset,
+        x="plot_time",
+        y="market_iv",
+        color="strike_label",
+        line_dash="product",
+        title="IV Per Strike Time Series",
+        labels={"plot_time": "timestamp", "market_iv": "market IV", "strike_label": "Strike"},
+        hover_data=["product", "strike", "underlying_price", "market_price", "moneyness"],
+    )
+    return fig
+
+
+def plot_smile_snapshot(options: pd.DataFrame, plot_time: float | int, fit_method: str) -> go.Figure:
+    """Plot one timestamp's smile with the selected fit overlaid."""
+
+    snapshot = options[options["plot_time"].eq(plot_time)].dropna(subset=["market_iv", "moneyness"])
+    fig = px.scatter(
+        snapshot,
+        x="moneyness",
+        y="market_iv",
+        color="strike_label",
+        title="Vol Smile Snapshot",
+        labels={"moneyness": "ln(K/S) / sqrt(TTE)", "market_iv": "market IV", "strike_label": "Strike"},
+        hover_data=["product", "strike", "underlying_price", "market_price", "fitted_iv"],
+    )
+
+    fit_points = snapshot.dropna(subset=["fitted_iv", "moneyness"]).sort_values("moneyness")
+    method_key = _fit_method_key(fit_method)
+    if method_key in {"quadratic", "cubic"} and not snapshot.empty:
+        degree = 2 if method_key == "quadratic" else 3
+        x = snapshot["moneyness"].to_numpy(dtype=float)
+        y = snapshot["market_iv"].to_numpy(dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if len(np.unique(x[finite])) >= degree + 1 and finite.sum() >= degree + 1:
+            coefficients = np.polyfit(x[finite], y[finite], degree)
+            x_grid = np.linspace(np.nanmin(x[finite]), np.nanmax(x[finite]), 100)
+            fig.add_trace(
+                go.Scatter(
+                    x=x_grid,
+                    y=np.polyval(coefficients, x_grid),
+                    mode="lines",
+                    name=f"{fit_method} fit",
+                    line={"color": "black", "width": 2},
+                )
+            )
+    elif not fit_points.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=fit_points["moneyness"],
+                y=fit_points["fitted_iv"],
+                mode="lines+markers",
+                name="rolling mean per strike",
+                line={"color": "black", "width": 2},
+            )
+        )
+    return fig
+
+
+def plot_smile_drift(options: pd.DataFrame, plot_times: list[float | int]) -> go.Figure:
+    """Overlay smiles from selected timestamps."""
+
+    subset = options[options["plot_time"].isin(plot_times)].dropna(subset=["market_iv", "moneyness"]).copy()
+    subset["timestamp_label"] = subset["plot_time"].map(lambda value: f"{value:g}")
+    fig = px.line(
+        subset.sort_values(["plot_time", "moneyness"]),
+        x="moneyness",
+        y="market_iv",
+        color="timestamp_label",
+        markers=True,
+        title="Smile Drift Across Timestamps",
+        labels={"moneyness": "ln(K/S) / sqrt(TTE)", "market_iv": "market IV", "timestamp_label": "Timestamp"},
+        hover_data=["product", "strike", "underlying_price", "market_price"],
+    )
+    return fig
+
+
+def plot_bs_price_scatter(options: pd.DataFrame) -> go.Figure:
+    """Plot fitted BS theoretical price against market price."""
+
+    subset = options.dropna(subset=["theoretical_price", "market_price", "moneyness"])
+    fig = px.scatter(
+        subset,
+        x="theoretical_price",
+        y="market_price",
+        color="moneyness",
+        symbol="product",
+        title="Theoretical BS Price Vs Market Price",
+        labels={
+            "theoretical_price": "BS theoretical price",
+            "market_price": "market price",
+            "moneyness": "moneyness",
+        },
+        hover_data=["product", "strike", "market_iv", "fitted_iv"],
+        color_continuous_scale="RdBu",
+    )
+    values = pd.concat([subset["theoretical_price"], subset["market_price"]]).replace([np.inf, -np.inf], np.nan).dropna()
+    if not values.empty:
+        low = float(values.min())
+        high = float(values.max())
+        fig.add_trace(
+            go.Scatter(
+                x=[low, high],
+                y=[low, high],
+                mode="lines",
+                name="y=x",
+                line={"color": "black", "dash": "dash"},
+            )
+        )
+    return fig
+
+
+def plot_iv_residuals(options: pd.DataFrame) -> go.Figure:
+    """Plot residuals between market IV and fitted IV."""
+
+    subset = options.dropna(subset=["iv_residual"])
+    fig = px.histogram(
+        subset,
+        x="iv_residual",
+        nbins=40,
+        title="IV Residuals: Market IV Minus Fitted IV",
+        labels={"iv_residual": "market IV - fitted IV"},
+    )
+    fig.add_vline(x=0, line_dash="dash", line_color="black")
+    return fig
+
+
+def plot_greek_time_series(options: pd.DataFrame, greek: str) -> go.Figure:
+    """Plot one Greek time series per voucher."""
+
+    subset = options.dropna(subset=[greek, "plot_time"])
+    title = f"{greek.capitalize()} Time Series Per Voucher"
+    fig = px.line(
+        subset,
+        x="plot_time",
+        y=greek,
+        color="product",
+        title=title,
+        labels={"plot_time": "timestamp", greek: greek},
+        hover_data=["strike", "underlying_price", "market_price", "market_iv", "moneyness"],
+    )
+    return fig
+
+
+def plot_portfolio_greeks(portfolio: pd.DataFrame) -> go.Figure:
+    """Plot aggregated portfolio delta, gamma, and vega."""
+
+    if portfolio.empty:
+        return go.Figure()
+    melted = portfolio.melt(
+        id_vars=["plot_time"],
+        value_vars=["portfolio_delta", "portfolio_gamma", "portfolio_vega"],
+        var_name="greek",
+        value_name="exposure",
+    )
+    fig = px.line(
+        melted,
+        x="plot_time",
+        y="exposure",
+        color="greek",
+        title="Portfolio Greeks",
+        labels={"plot_time": "timestamp", "exposure": "exposure"},
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    return fig
+
+
+def plot_hedge_error(portfolio: pd.DataFrame, threshold: float) -> go.Figure:
+    """Plot absolute portfolio delta with rebalance threshold."""
+
+    fig = px.line(
+        portfolio,
+        x="plot_time",
+        y="abs_portfolio_delta",
+        title="Hedge Error: Absolute Portfolio Delta",
+        labels={"plot_time": "timestamp", "abs_portfolio_delta": "|portfolio delta|"},
+    )
+    fig.add_hline(y=threshold, line_dash="dash", line_color="firebrick", annotation_text="rebalance threshold")
+    return fig
+
+
+def plot_option_pnl_attribution(attribution: pd.DataFrame) -> go.Figure:
+    """Plot options PnL attribution components by product."""
+
+    components = ["inventory_pnl", "spread_capture_pnl", "hedge_pnl", "theta_decay", "residual_pnl_est"]
+    subset = attribution[attribution["product"].ne("TOTAL_OPTION_PORTFOLIO")].copy()
+    melted = subset.melt(
+        id_vars=["product", "role"],
+        value_vars=components,
+        var_name="component",
+        value_name="pnl",
+    )
+    fig = px.bar(
+        melted,
+        x="product",
+        y="pnl",
+        color="component",
+        title="Options PnL Attribution",
+        labels={"product": "product", "pnl": "PnL", "component": "component"},
+        barmode="relative",
+    )
+    return fig
+
+
 def render_debug_log(debug_lines: pd.DataFrame, timestamp: int | None, limit: int = 200) -> None:
     """Render timestamp-filtered custom lambda logs."""
 
@@ -817,6 +1651,45 @@ def main() -> None:
         st.warning("Select at least one product.")
         return
 
+    option_chain = infer_option_chain(products)
+    option_products: list[str] = []
+    underlying_product: str | None = None
+    option_expiry_day = float(default_option_expiry_day(activities))
+    delta_rebalance_threshold = 20.0
+    if not option_chain.empty:
+        available_options = sorted(option_chain["product"].unique())
+        default_options = [product for product in available_options if product in selected_products] or available_options
+        with st.sidebar:
+            st.subheader("Options Analytics")
+            option_products = st.multiselect("Voucher products", available_options, default=default_options)
+            underlying_choices = sorted(products)
+            inferred_underlying = infer_underlying_product(products, option_products)
+            underlying_index = (
+                underlying_choices.index(inferred_underlying)
+                if inferred_underlying in underlying_choices
+                else 0
+            )
+            underlying_product = st.selectbox("Underlying product", underlying_choices, index=underlying_index)
+            option_expiry_day = st.number_input(
+                "Option expiry day",
+                min_value=0.0,
+                value=option_expiry_day,
+                step=1.0,
+            )
+            delta_rebalance_threshold = st.number_input(
+                "Delta rebalance threshold",
+                min_value=0.0,
+                value=delta_rebalance_threshold,
+                step=1.0,
+            )
+
+    options_analytics = build_options_analytics(
+        activities,
+        option_products,
+        underlying_product,
+        option_expiry_day,
+    )
+
     latest_total_pnl = (
         activities.sort_values("timestamp").groupby(PRODUCT_COLUMN).tail(1)["profit_and_loss"].sum()
     )
@@ -829,8 +1702,8 @@ def main() -> None:
     metric_columns[2].metric("Own fills", f"{own_fill_count:,}")
     metric_columns[3].metric("Indicators", f"{len(indicators):,}")
 
-    tab_market, tab_pnl, tab_fills, tab_indicators, tab_logs, tab_raw = st.tabs(
-        ["Market", "PnL", "Fill Rate", "Indicators", "Logs", "Raw Data"]
+    tab_market, tab_volatility, tab_greeks, tab_pnl, tab_fills, tab_indicators, tab_logs, tab_raw = st.tabs(
+        ["Market", "Volatility Surface", "Greeks", "PnL", "Fill Rate", "Indicators", "Logs", "Raw Data"]
     )
 
     with tab_market:
@@ -857,6 +1730,62 @@ def main() -> None:
             if selected_pairs:
                 st.plotly_chart(plot_pair_spreads(pair_spreads, selected_pairs), use_container_width=True)
 
+    with tab_volatility:
+        if option_chain.empty:
+            st.info("No voucher/option products detected. Expected names containing VOUCHER or OPTION with a trailing strike.")
+        elif options_analytics.empty:
+            st.warning("Select voucher products and a matching underlying to build volatility analytics.")
+        else:
+            fit_method = st.selectbox("Smile fit", SMILE_FIT_METHODS)
+            fitted_options = fit_volatility_surface(options_analytics, fit_method)
+            st.plotly_chart(plot_iv_time_series(fitted_options), use_container_width=True)
+
+            option_times = sorted(fitted_options["plot_time"].dropna().unique())
+            if option_times:
+                default_smile_time = min(
+                    option_times,
+                    key=lambda value: abs(float(value) - float(selected_timestamp or value)),
+                )
+                smile_time = st.select_slider(
+                    "Smile timestamp",
+                    options=option_times,
+                    value=default_smile_time,
+                )
+                st.plotly_chart(
+                    plot_smile_snapshot(fitted_options, smile_time, fit_method),
+                    use_container_width=True,
+                )
+
+                drift_defaults = evenly_spaced_values(option_times, 5)
+                drift_times = st.multiselect(
+                    "Smile drift timestamps",
+                    option_times,
+                    default=drift_defaults,
+                )
+                if drift_times:
+                    st.plotly_chart(plot_smile_drift(fitted_options, drift_times), use_container_width=True)
+
+            st.plotly_chart(plot_bs_price_scatter(fitted_options), use_container_width=True)
+            st.plotly_chart(plot_iv_residuals(fitted_options), use_container_width=True)
+
+    with tab_greeks:
+        if options_analytics.empty:
+            st.info("No option Greek series available for the current voucher/underlying selection.")
+        else:
+            for greek in ["delta", "gamma", "vega", "theta"]:
+                st.plotly_chart(plot_greek_time_series(options_analytics, greek), use_container_width=True)
+
+            portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
+            if portfolio_greeks.empty:
+                st.info("No portfolio Greek exposure available. Own-trade history may be empty.")
+            else:
+                st.plotly_chart(plot_portfolio_greeks(portfolio_greeks), use_container_width=True)
+                st.plotly_chart(
+                    plot_hedge_error(portfolio_greeks, delta_rebalance_threshold),
+                    use_container_width=True,
+                )
+                st.dataframe(portfolio_greeks.tail(25), use_container_width=True, hide_index=True)
+
     with tab_pnl:
         st.plotly_chart(plot_pnl(activities, selected_products), use_container_width=True)
         pnl_table = decompose_pnl(activities[activities[PRODUCT_COLUMN].isin(selected_products)], trades)
@@ -865,6 +1794,20 @@ def main() -> None:
             "Market-making PnL is estimated from fill edge versus mid at fill time. "
             "Directional PnL is the residual against official mark-to-market PnL."
         )
+        option_attribution = build_option_pnl_attribution(
+            activities,
+            trades,
+            options_analytics,
+            underlying_product,
+        )
+        if not option_attribution.empty:
+            st.subheader("Options PnL Attribution")
+            st.plotly_chart(plot_option_pnl_attribution(option_attribution), use_container_width=True)
+            st.dataframe(option_attribution, use_container_width=True, hide_index=True)
+            st.caption(
+                "Options attribution assumes call vouchers, flat opening inventory, and hedge PnL allocated to the "
+                "selected underlying leg. Theta decay uses annualized BS theta times elapsed TTE."
+            )
 
     with tab_fills:
         fill_report = build_fill_report(parsed, selected_products)
