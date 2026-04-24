@@ -16,37 +16,67 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.dashboard import (  # noqa: E402
+    DEFAULT_POSITION_LIMIT,
+    DEFAULT_RUNTIME_TIMEOUT_MS,
     PRODUCT_COLUMN,
     SMILE_FIT_METHODS,
     add_rolling_z_scores,
+    build_basket_hedge_tracker,
+    build_conversion_report,
+    build_fill_by_price_distance,
     build_option_pnl_attribution,
     build_options_analytics,
     build_fill_report,
+    build_iv_residual_z_scores,
     build_normalized_mid_series,
     build_pair_spreads,
+    build_position_limit_report,
     build_portfolio_greeks,
+    build_rejected_order_report,
+    build_runtime_report,
+    build_single_spread_series,
+    build_spread_stationarity,
+    build_synthetic_basket,
+    build_trader_flow,
+    compare_product_pnl,
     decompose_pnl,
     default_option_expiry_day,
+    downsample_by_timestamp,
     evenly_spaced_values,
     fit_volatility_surface,
     infer_option_chain,
     infer_underlying_product,
+    nearest_value,
     parse_backtest_text,
+    parse_basket_formula,
+    parse_position_limits,
+    plot_basket_spread,
     plot_bs_price_scatter,
+    plot_conversion_pnl,
+    plot_fill_by_distance,
     plot_greek_time_series,
     plot_hedge_error,
     plot_indicators,
     plot_iv_residuals,
+    plot_iv_residual_z_scores,
     plot_iv_time_series,
     plot_normalized_mid,
     plot_orderbook,
     plot_option_pnl_attribution,
+    plot_parameter_sweep_heatmap,
     plot_pair_spreads,
+    plot_pnl_diff,
     plot_pnl,
+    plot_position_limits,
     plot_portfolio_greeks,
+    plot_runtime_report,
     plot_smile_drift,
     plot_smile_snapshot,
     plot_spreads,
+    plot_spread_histogram,
+    plot_stationarity_diagnostics,
+    plot_synthetic_basket,
+    plot_trader_flow,
     plot_z_scores,
     prepare_indicator_labels,
     render_debug_log,
@@ -54,7 +84,7 @@ from tools.dashboard import (  # noqa: E402
 
 
 DEFAULT_MAX_UPLOAD_MB = 25
-ALLOWED_SUFFIXES = {".log", ".txt"}
+ALLOWED_SUFFIXES = {".log", ".txt", ".json"}
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -98,7 +128,7 @@ def validate_upload(name: str, size: int, max_upload_mb: int) -> str | None:
     return None
 
 
-@st.cache_data(show_spinner=False, max_entries=4, ttl=60 * 60)
+@st.cache_data(show_spinner=False, max_entries=10, ttl=60 * 60)
 def parse_uploaded_log(source_name: str, checksum: str, text: str):
     """Parse uploaded log text and cache by checksum."""
 
@@ -115,7 +145,40 @@ def decode_upload(uploaded_file) -> tuple[str, str]:
     return checksum, text
 
 
-def render_dashboard(parsed) -> None:
+def timestamp_number_input(label: str, timestamps: list[int | float], key: str) -> int | float | None:
+    """Render a cheap timestamp input and snap to the nearest available timestamp."""
+
+    if not timestamps:
+        return None
+    minimum = int(min(timestamps))
+    maximum = int(max(timestamps))
+    selected = st.number_input(label, min_value=minimum, max_value=maximum, value=maximum, step=1, key=key)
+    return nearest_value(timestamps, selected)
+
+
+def parse_parameter_sweep_upload(uploaded_file) -> pd.DataFrame:
+    """Parse grid-search CSV/JSON uploads."""
+
+    if uploaded_file is None:
+        return pd.DataFrame()
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".json":
+        return pd.read_json(uploaded_file)
+    return pd.read_csv(uploaded_file)
+
+
+def style_delta_table(frame: pd.DataFrame):
+    """Color PnL deltas for submission diffs."""
+
+    def color_delta(value):
+        if pd.isna(value):
+            return ""
+        return "color: #15803d" if value >= 0 else "color: #b91c1c"
+
+    return frame.style.map(color_delta, subset=["delta_pnl"])
+
+
+def render_dashboard(parsed, comparison=None) -> None:
     """Render dashboard controls and visualizations for one parsed log."""
 
     with st.sidebar:
@@ -123,6 +186,7 @@ def render_dashboard(parsed) -> None:
         z_window = st.slider("Rolling z-score window", min_value=10, max_value=500, value=100, step=10)
         entry_threshold = st.number_input("Entry z-score threshold", value=2.0, min_value=0.1, step=0.1)
         exit_threshold = st.number_input("Exit z-score threshold", value=0.5, min_value=0.0, step=0.1)
+        z_score_source = st.selectbox("Z-score source", ["mid_price", "iv_residual"])
         max_plot_points = st.slider("Max plotted timestamps", min_value=500, max_value=20000, value=5000, step=500)
 
     activities = add_rolling_z_scores(parsed.activities, z_window)
@@ -134,14 +198,10 @@ def render_dashboard(parsed) -> None:
         return
 
     products = sorted(activities[PRODUCT_COLUMN].dropna().unique())
+    timestamps = sorted(activities["timestamp"].dropna().unique())
     with st.sidebar:
         selected_products = st.multiselect("Products", products, default=products)
-        timestamps = sorted(activities["timestamp"].dropna().unique())
-        selected_timestamp = st.select_slider(
-            "Debug timestamp",
-            options=timestamps,
-            value=timestamps[-1] if timestamps else None,
-        )
+        selected_timestamp = timestamp_number_input("Debug timestamp", timestamps, "debug_timestamp")
 
     if not selected_products:
         st.warning("Select at least one product.")
@@ -160,18 +220,9 @@ def render_dashboard(parsed) -> None:
             option_products = st.multiselect("Voucher products", available_options, default=default_options)
             underlying_choices = sorted(products)
             inferred_underlying = infer_underlying_product(products, option_products)
-            underlying_index = (
-                underlying_choices.index(inferred_underlying)
-                if inferred_underlying in underlying_choices
-                else 0
-            )
+            underlying_index = underlying_choices.index(inferred_underlying) if inferred_underlying in underlying_choices else 0
             underlying_product = st.selectbox("Underlying product", underlying_choices, index=underlying_index)
-            option_expiry_day = st.number_input(
-                "Option expiry day",
-                min_value=0.0,
-                value=option_expiry_day,
-                step=1.0,
-            )
+            option_expiry_day = st.number_input("Option expiry day", min_value=0.0, value=option_expiry_day, step=1.0)
             delta_rebalance_threshold = st.number_input(
                 "Delta rebalance threshold",
                 min_value=0.0,
@@ -179,12 +230,8 @@ def render_dashboard(parsed) -> None:
                 step=1.0,
             )
 
-    options_analytics = build_options_analytics(
-        activities,
-        option_products,
-        underlying_product,
-        option_expiry_day,
-    )
+    def current_options() -> pd.DataFrame:
+        return build_options_analytics(activities, option_products, underlying_product, option_expiry_day)
 
     latest_total_pnl = activities.sort_values("timestamp").groupby(PRODUCT_COLUMN).tail(1)["profit_and_loss"].sum()
     own_fill_count = int(trades["is_own_trade"].sum()) if not trades.empty else 0
@@ -195,26 +242,40 @@ def render_dashboard(parsed) -> None:
     metric_columns[2].metric("Own fills", f"{own_fill_count:,}")
     metric_columns[3].metric("Indicators", f"{len(indicators):,}")
 
-    portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
-    if not portfolio_greeks.empty:
-        latest_greeks = portfolio_greeks.tail(1).iloc[0]
-        greek_columns = st.columns(4)
-        greek_columns[0].metric("Net Delta", f"{latest_greeks['portfolio_delta']:,.2f}")
-        greek_columns[1].metric("Net Gamma", f"{latest_greeks['portfolio_gamma']:,.2f}")
-        greek_columns[2].metric("Net Vega", f"{latest_greeks['portfolio_vega']:,.2f}")
-        greek_columns[3].metric("Net Theta", f"{latest_greeks['portfolio_theta']:,.2f}")
+    views = [
+        "Market",
+        "Volatility Surface",
+        "Greeks",
+        "PnL",
+        "Stationarity",
+        "Baskets",
+        "Risk",
+        "Fill Rate",
+        "Parameter Sweep",
+        "Submission Diff",
+        "Runtime",
+        "Trader Flow",
+        "Conversions",
+        "Indicators",
+        "Logs",
+        "Raw Data",
+    ]
+    view = st.radio("Dashboard view", views, horizontal=True)
 
-    tab_market, tab_volatility, tab_greeks, tab_pnl, tab_fills, tab_indicators, tab_logs, tab_raw = st.tabs(
-        ["Market", "Volatility Surface", "Greeks", "PnL", "Fill Rate", "Indicators", "Logs", "Raw Data"]
-    )
-
-    with tab_market:
+    if view == "Market":
         st.plotly_chart(plot_orderbook(activities, trades, selected_products, max_plot_points), use_container_width=True)
-        st.plotly_chart(plot_spreads(activities, selected_products), use_container_width=True)
-        st.plotly_chart(
-            plot_z_scores(activities, selected_products, entry_threshold, exit_threshold),
-            use_container_width=True,
-        )
+        st.plotly_chart(plot_spreads(downsample_by_timestamp(activities, max_plot_points), selected_products), use_container_width=True)
+        if z_score_source == "mid_price":
+            st.plotly_chart(plot_z_scores(activities, selected_products, entry_threshold, exit_threshold), use_container_width=True)
+        else:
+            options_analytics = current_options()
+            if options_analytics.empty:
+                st.info("IV residual z-scores need voucher products and a selected underlying.")
+            else:
+                fit_method = st.selectbox("IV residual fit", SMILE_FIT_METHODS)
+                fitted_options = fit_volatility_surface(options_analytics, fit_method)
+                residual_z = build_iv_residual_z_scores(fitted_options, z_window)
+                st.plotly_chart(plot_iv_residual_z_scores(residual_z, entry_threshold, exit_threshold), use_container_width=True)
 
         normalizer_options = ["none", "rolling_mean"]
         if not indicators.empty:
@@ -222,130 +283,238 @@ def render_dashboard(parsed) -> None:
         normalizer = st.selectbox("Normalize mid-price by", normalizer_options)
         normalized = build_normalized_mid_series(activities, selected_products, normalizer, indicators)
         if not normalized.empty:
-            st.plotly_chart(plot_normalized_mid(normalized), use_container_width=True)
+            st.plotly_chart(plot_normalized_mid(downsample_by_timestamp(normalized, max_plot_points)), use_container_width=True)
 
-        pair_spreads = build_pair_spreads(activities, z_window)
-        if not pair_spreads.empty:
-            pair_choices = sorted(pair_spreads["pair"].unique())
-            selected_pairs = st.multiselect("Pair/basket spreads", pair_choices, default=pair_choices[:3])
-            if selected_pairs:
-                st.plotly_chart(plot_pair_spreads(pair_spreads, selected_pairs), use_container_width=True)
+        if len(selected_products) >= 2:
+            left = st.selectbox("Pair left", selected_products, index=0)
+            right_default = 1 if len(selected_products) > 1 else 0
+            right = st.selectbox("Pair right", selected_products, index=right_default)
+            pair_spread = build_single_spread_series(activities, left, right, z_window)
+            if not pair_spread.empty:
+                st.plotly_chart(plot_pair_spreads(pair_spread, [pair_spread["pair"].iloc[0]]), use_container_width=True)
 
-    with tab_volatility:
+    elif view == "Volatility Surface":
         if option_chain.empty:
             st.info("No voucher/option products detected. Expected names containing VOUCHER or OPTION with a trailing strike.")
-        elif options_analytics.empty:
-            st.warning("Select voucher products and a matching underlying to build volatility analytics.")
         else:
-            fit_method = st.selectbox("Smile fit", SMILE_FIT_METHODS)
-            fitted_options = fit_volatility_surface(options_analytics, fit_method)
-            st.plotly_chart(plot_iv_time_series(fitted_options), use_container_width=True)
+            options_analytics = current_options()
+            if options_analytics.empty:
+                st.warning("Select voucher products and a matching underlying to build volatility analytics.")
+            else:
+                fit_method = st.selectbox("Smile fit", SMILE_FIT_METHODS)
+                fitted_options = fit_volatility_surface(options_analytics, fit_method)
+                fitted_plot = downsample_by_timestamp(fitted_options, max_plot_points)
+                st.plotly_chart(plot_iv_time_series(fitted_plot), use_container_width=True)
 
-            option_times = sorted(fitted_options["plot_time"].dropna().unique())
-            if option_times:
-                default_smile_time = min(
-                    option_times,
-                    key=lambda value: abs(float(value) - float(selected_timestamp or value)),
-                )
-                smile_time = st.select_slider(
-                    "Smile timestamp",
-                    options=option_times,
-                    value=default_smile_time,
-                )
-                st.plotly_chart(
-                    plot_smile_snapshot(fitted_options, smile_time, fit_method),
-                    use_container_width=True,
-                )
+                option_times = sorted(fitted_options["plot_time"].dropna().unique())
+                if option_times:
+                    smile_time = timestamp_number_input("Smile timestamp", option_times, "smile_timestamp")
+                    if smile_time is not None:
+                        st.plotly_chart(plot_smile_snapshot(fitted_options, smile_time, fit_method), use_container_width=True)
+                    drift_defaults = evenly_spaced_values(option_times, 5)
+                    drift_times = st.multiselect("Smile drift timestamps", option_times, default=drift_defaults)
+                    if drift_times:
+                        st.plotly_chart(plot_smile_drift(fitted_options, drift_times), use_container_width=True)
 
-                drift_defaults = evenly_spaced_values(option_times, 5)
-                drift_times = st.multiselect(
-                    "Smile drift timestamps",
-                    option_times,
-                    default=drift_defaults,
-                )
-                if drift_times:
-                    st.plotly_chart(plot_smile_drift(fitted_options, drift_times), use_container_width=True)
+                st.plotly_chart(plot_bs_price_scatter(fitted_plot), use_container_width=True)
+                st.plotly_chart(plot_iv_residuals(fitted_options), use_container_width=True)
+                residual_z = build_iv_residual_z_scores(fitted_options, z_window)
+                st.plotly_chart(plot_iv_residual_z_scores(residual_z, entry_threshold, exit_threshold), use_container_width=True)
 
-            st.plotly_chart(plot_bs_price_scatter(fitted_options), use_container_width=True)
-            st.plotly_chart(plot_iv_residuals(fitted_options), use_container_width=True)
-
-    with tab_greeks:
+    elif view == "Greeks":
+        options_analytics = current_options()
         if options_analytics.empty:
             st.info("No option Greek series available for the current voucher/underlying selection.")
         else:
+            options_plot = downsample_by_timestamp(options_analytics, max_plot_points)
             for greek in ["delta", "gamma", "vega", "theta", "rho"]:
-                st.plotly_chart(plot_greek_time_series(options_analytics, greek), use_container_width=True)
-
+                if greek in options_plot:
+                    st.plotly_chart(plot_greek_time_series(options_plot, greek), use_container_width=True)
+            portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
             if portfolio_greeks.empty:
                 st.info("No portfolio Greek exposure available. Own-trade history may be empty.")
             else:
-                st.plotly_chart(plot_portfolio_greeks(portfolio_greeks), use_container_width=True)
-                st.plotly_chart(
-                    plot_hedge_error(portfolio_greeks, delta_rebalance_threshold),
-                    use_container_width=True,
-                )
+                latest_greeks = portfolio_greeks.tail(1).iloc[0]
+                greek_columns = st.columns(4)
+                greek_columns[0].metric("Net Delta", f"{latest_greeks['portfolio_delta']:,.2f}")
+                greek_columns[1].metric("Net Gamma", f"{latest_greeks['portfolio_gamma']:,.2f}")
+                greek_columns[2].metric("Net Vega", f"{latest_greeks['portfolio_vega']:,.2f}")
+                greek_columns[3].metric("Net Theta", f"{latest_greeks['portfolio_theta']:,.2f}")
+                portfolio_plot = downsample_by_timestamp(portfolio_greeks, max_plot_points)
+                st.plotly_chart(plot_portfolio_greeks(portfolio_plot), use_container_width=True)
+                st.plotly_chart(plot_hedge_error(portfolio_plot, delta_rebalance_threshold), use_container_width=True)
                 st.dataframe(portfolio_greeks.tail(25), use_container_width=True, hide_index=True)
 
-    with tab_pnl:
-        st.plotly_chart(plot_pnl(activities, selected_products), use_container_width=True)
+    elif view == "PnL":
+        st.plotly_chart(plot_pnl(downsample_by_timestamp(activities, max_plot_points), selected_products), use_container_width=True)
         st.dataframe(
             decompose_pnl(activities[activities[PRODUCT_COLUMN].isin(selected_products)], trades),
             use_container_width=True,
             hide_index=True,
         )
-        option_attribution = build_option_pnl_attribution(
-            activities,
-            trades,
-            options_analytics,
-            underlying_product,
-        )
+        options_analytics = current_options()
+        option_attribution = build_option_pnl_attribution(activities, trades, options_analytics, underlying_product)
         if not option_attribution.empty:
             st.subheader("Options PnL Attribution")
             st.plotly_chart(plot_option_pnl_attribution(option_attribution), use_container_width=True)
             st.dataframe(option_attribution, use_container_width=True, hide_index=True)
             st.caption(
-                "Options attribution assumes call vouchers, flat opening inventory, and hedge PnL allocated to the "
-                "selected underlying leg. Theta decay uses annualized BS theta times elapsed TTE."
+                "Inventory PnL is mark-to-market on held positions. Delta/gamma/vega/theta columns decompose option "
+                "inventory PnL; hedge PnL is allocated to the selected underlying leg."
             )
 
-    with tab_fills:
+    elif view == "Stationarity":
+        if len(selected_products) < 2:
+            st.info("Select at least two products for spread diagnostics.")
+        else:
+            left = st.selectbox("Spread left", selected_products, index=0)
+            right = st.selectbox("Spread right", selected_products, index=min(1, len(selected_products) - 1))
+            stationarity_window = st.slider("Stationarity window", min_value=20, max_value=1000, value=max(100, z_window), step=20)
+            spread_frame = build_single_spread_series(activities, left, right, z_window)
+            if spread_frame.empty:
+                st.info("No spread series available for this pair.")
+            else:
+                diagnostics = build_spread_stationarity(spread_frame, stationarity_window)
+                st.plotly_chart(plot_pair_spreads(spread_frame, [spread_frame["pair"].iloc[0]]), use_container_width=True)
+                st.plotly_chart(plot_stationarity_diagnostics(diagnostics), use_container_width=True)
+                st.plotly_chart(plot_spread_histogram(spread_frame), use_container_width=True)
+                st.caption("ADF p-values are a lightweight left-tail approximation because statsmodels is not a dependency.")
+
+    elif view == "Baskets":
+        formula = st.text_input("Basket formula", value="")
+        basket_product, weights, error = parse_basket_formula(formula, products)
+        if error:
+            st.info(error)
+        else:
+            basket_frame = build_synthetic_basket(activities, basket_product, weights, z_window)
+            if basket_frame.empty:
+                st.warning("Could not build the synthetic basket from the selected formula.")
+            else:
+                st.plotly_chart(plot_synthetic_basket(downsample_by_timestamp(basket_frame, max_plot_points)), use_container_width=True)
+                st.plotly_chart(plot_basket_spread(basket_frame, entry_threshold, exit_threshold), use_container_width=True)
+                positions = build_basket_hedge_tracker(activities, trades, basket_product, weights)
+                basket_position = st.number_input(
+                    "Basket position for hedge tracker",
+                    value=float(-positions["target_position"].iloc[0] / positions["coefficient"].iloc[0]) if not positions.empty and positions["coefficient"].iloc[0] else 0.0,
+                    step=1.0,
+                )
+                st.dataframe(
+                    build_basket_hedge_tracker(activities, trades, basket_product, weights, basket_position),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    elif view == "Risk":
+        default_limit = st.number_input("Default product limit", min_value=1.0, value=float(DEFAULT_POSITION_LIMIT), step=1.0)
+        overrides = st.text_area("Position limit overrides", value="", placeholder="AMETHYSTS=20, STARFRUIT=20")
+        limits = parse_position_limits(overrides, selected_products, default_limit)
+        limit_report = build_position_limit_report(activities, trades, selected_products, limits)
+        st.plotly_chart(plot_position_limits(limit_report), use_container_width=True)
+        st.dataframe(limit_report, use_container_width=True, hide_index=True)
+        rejected = build_rejected_order_report(parsed.order_intents, trades, selected_products, limits)
+        st.subheader("Orders That Would Breach Limits")
+        if rejected.empty:
+            st.info("No rejected-order candidates found from parsed order intent logs.")
+        else:
+            st.dataframe(rejected, use_container_width=True, hide_index=True)
+
+    elif view == "Fill Rate":
         fill_report = build_fill_report(parsed, selected_products)
         if fill_report.empty:
             st.info("No fill diagnostics available.")
         else:
             st.dataframe(fill_report, use_container_width=True, hide_index=True)
-        if parsed.order_intents.empty:
-            st.warning(
-                "No structured order submission logs found. For exact fill rate, print lines like "
-                "`ORDER product=ASH_COATED_OSMIUM side=BUY price=9999 qty=10`."
-            )
+        by_distance = build_fill_by_price_distance(parsed, selected_products)
+        if by_distance.empty:
+            st.info("Fill-rate by price distance needs structured order logs with product, side, price, and quantity.")
+        else:
+            st.plotly_chart(plot_fill_by_distance(by_distance), use_container_width=True)
+            st.dataframe(by_distance, use_container_width=True, hide_index=True)
 
-    with tab_indicators:
+    elif view == "Parameter Sweep":
+        sweep_file = st.file_uploader("Upload grid-search CSV/JSON", type=["csv", "json"], key="parameter_sweep")
+        sweep = parse_parameter_sweep_upload(sweep_file)
+        required = {"entry_threshold", "exit_threshold", "window", "pnl", "sharpe"}
+        if sweep.empty:
+            st.info("Upload a CSV/JSON with entry_threshold, exit_threshold, window, pnl, sharpe.")
+        elif not required.issubset(sweep.columns):
+            st.error(f"Missing required columns: {', '.join(sorted(required - set(sweep.columns)))}")
+        else:
+            metric = st.selectbox("Heatmap metric", ["pnl", "sharpe"])
+            windows = sorted(sweep["window"].dropna().unique())
+            selected_window = st.selectbox("Window", windows)
+            st.plotly_chart(plot_parameter_sweep_heatmap(sweep, metric, selected_window), use_container_width=True)
+            st.dataframe(sweep, use_container_width=True, hide_index=True)
+
+    elif view == "Submission Diff":
+        if comparison is None:
+            st.info("Upload an optional comparison log in the sidebar to see per-product PnL deltas.")
+        else:
+            diff = compare_product_pnl(comparison.activities, parsed.activities)
+            st.plotly_chart(plot_pnl_diff(diff), use_container_width=True)
+            st.dataframe(style_delta_table(diff), use_container_width=True, hide_index=True)
+            st.caption("Delta is primary uploaded log minus comparison log.")
+
+    elif view == "Runtime":
+        threshold = st.number_input("IMC timeout threshold ms", min_value=1.0, value=DEFAULT_RUNTIME_TIMEOUT_MS, step=50.0)
+        runtime = build_runtime_report(parsed.sandbox)
+        if runtime.empty:
+            st.info("No runtime or lambdaLog timestamp-gap data available.")
+        else:
+            st.plotly_chart(plot_runtime_report(runtime, threshold), use_container_width=True)
+            st.dataframe(runtime.tail(50), use_container_width=True, hide_index=True)
+
+    elif view == "Trader Flow":
+        flow = build_trader_flow(trades, selected_products)
+        if flow.empty:
+            st.info("No counterparty flow available in the trade history.")
+        else:
+            counterparties = sorted(flow["counterparty"].dropna().unique())
+            selected_counterparties = st.multiselect("Counterparties", counterparties, default=counterparties[: min(8, len(counterparties))])
+            filtered = flow[flow["counterparty"].isin(selected_counterparties)] if selected_counterparties else flow
+            st.plotly_chart(plot_trader_flow(filtered), use_container_width=True)
+            summary = filtered.groupby(["counterparty", "product", "side"], as_index=False).agg(
+                volume=("quantity", "sum"),
+                trades=("quantity", "size"),
+                avg_price=("price", "mean"),
+            )
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    elif view == "Conversions":
+        conversions = build_conversion_report(parsed.debug_lines)
+        if conversions.empty:
+            st.info("No conversion debug prints parsed. Expected lines like CONVERSION product=ORCHIDS qty=10 price=100 pnl=5.")
+        else:
+            if conversions["pnl"].notna().any():
+                st.plotly_chart(plot_conversion_pnl(conversions), use_container_width=True)
+            st.dataframe(conversions, use_container_width=True, hide_index=True)
+
+    elif view == "Indicators":
         if indicators.empty:
             st.info("No JSON numeric indicators found in lambdaLog.")
         else:
             labels = sorted(indicators["label"].unique())
             selected = st.multiselect("Indicators", labels, default=labels[: min(5, len(labels))])
             if selected:
-                st.plotly_chart(plot_indicators(indicators, selected), use_container_width=True)
+                st.plotly_chart(plot_indicators(indicators[indicators["label"].isin(selected)], selected), use_container_width=True)
             st.dataframe(indicators.drop(columns=["source_line"]), use_container_width=True, hide_index=True)
 
-    with tab_logs:
-        render_debug_log(parsed.debug_lines, int(selected_timestamp) if selected_timestamp is not None else None)
+    elif view == "Logs":
+        log_products = st.multiselect("Filter debug lines by product", products, default=[])
+        render_debug_log(parsed.debug_lines, int(selected_timestamp) if selected_timestamp is not None else None, product_filter=log_products)
         sandbox_errors = parsed.sandbox[parsed.sandbox["sandboxLog"].astype(str).str.len() > 0]
         st.subheader("Sandbox Errors")
         st.dataframe(sandbox_errors, use_container_width=True, hide_index=True)
 
-    with tab_raw:
+    elif view == "Raw Data":
         st.subheader("Activities")
         st.dataframe(activities[activities[PRODUCT_COLUMN].isin(selected_products)], use_container_width=True)
         st.subheader("Trade History")
         st.dataframe(trades[trades["symbol"].isin(selected_products)] if not trades.empty else trades)
         st.subheader("Parsed Order Intents")
         st.dataframe(parsed.order_intents, use_container_width=True, hide_index=True)
-        if not activities.empty:
-            csv = activities.to_csv(index=False).encode("utf-8")
-            st.download_button("Download parsed activities CSV", csv, "parsed_activities.csv", "text/csv")
+        csv = activities.to_csv(index=False).encode("utf-8")
+        st.download_button("Download parsed activities CSV", csv, "parsed_activities.csv", "text/csv")
 
 
 def main() -> None:
@@ -361,10 +530,16 @@ def main() -> None:
     st.caption("Upload a Prosperity backtest `.log` file. Files are parsed in memory and are not written to disk.")
 
     uploaded_file = st.file_uploader(
-        "Upload backtest log",
-        type=["log", "txt"],
+        "Upload primary backtest log",
+        type=["log", "txt", "json"],
         accept_multiple_files=False,
         help=f"Maximum accepted size: {max_upload_mb} MB.",
+    )
+    comparison_file = st.file_uploader(
+        "Optional comparison log",
+        type=["log", "txt", "json"],
+        accept_multiple_files=False,
+        help="Used by the Submission Diff view.",
     )
 
     if uploaded_file is None:
@@ -380,7 +555,17 @@ def main() -> None:
     with st.spinner("Parsing uploaded log..."):
         parsed = parse_uploaded_log(uploaded_file.name, checksum, text)
 
-    render_dashboard(parsed)
+    comparison = None
+    if comparison_file is not None:
+        comparison_error = validate_upload(comparison_file.name, comparison_file.size, max_upload_mb)
+        if comparison_error:
+            st.error(comparison_error)
+            return
+        comparison_checksum, comparison_text = decode_upload(comparison_file)
+        with st.spinner("Parsing comparison log..."):
+            comparison = parse_uploaded_log(comparison_file.name, comparison_checksum, comparison_text)
+
+    render_dashboard(parsed, comparison)
 
 
 if __name__ == "__main__":

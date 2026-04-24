@@ -56,6 +56,8 @@ SUBMISSION = "SUBMISSION"
 DEFAULT_TICKS_PER_DAY = 1_000_000
 DEFAULT_DAYS_PER_YEAR = 365
 SMILE_FIT_METHODS = ["quadratic", "cubic", "rolling mean per strike"]
+DEFAULT_POSITION_LIMIT = 20
+DEFAULT_RUNTIME_TIMEOUT_MS = 900.0
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,20 @@ def _section_bounds(text: str) -> tuple[str, str, str]:
     return sandbox_text, activities_text, trades_text
 
 
+def _normalise_sandbox_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+    """Return standard sandbox columns from decoded sandbox rows."""
+
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "sandboxLog", "lambdaLog"])
+
+    frame = pd.DataFrame(rows)
+    for column in ["timestamp", "sandboxLog", "lambdaLog"]:
+        if column not in frame:
+            frame[column] = "" if column != "timestamp" else pd.NA
+    frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce").astype("Int64")
+    return frame[["timestamp", "sandboxLog", "lambdaLog"]]
+
+
 def _parse_sandbox_logs(sandbox_text: str) -> pd.DataFrame:
     """Parse concatenated JSON sandbox rows emitted by the local backtester."""
 
@@ -117,18 +133,21 @@ def _parse_sandbox_logs(sandbox_text: str) -> pd.DataFrame:
                 break
             idx = next_open
             continue
-        rows.append(obj)
+        if isinstance(obj, list):
+            rows.extend(row for row in obj if isinstance(row, dict))
+        elif isinstance(obj, dict):
+            rows.append(obj)
         idx = end
 
-    if not rows:
-        return pd.DataFrame(columns=["timestamp", "sandboxLog", "lambdaLog"])
+    return _normalise_sandbox_frame(rows)
 
-    frame = pd.DataFrame(rows)
-    for column in ["sandboxLog", "lambdaLog"]:
-        if column not in frame:
-            frame[column] = ""
-    frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce").astype("Int64")
-    return frame[["timestamp", "sandboxLog", "lambdaLog"]]
+
+def _parse_sandbox_rows(rows: Any) -> pd.DataFrame:
+    """Parse sandbox rows already decoded from a JSON envelope."""
+
+    if not isinstance(rows, list):
+        return pd.DataFrame(columns=["timestamp", "sandboxLog", "lambdaLog"])
+    return _normalise_sandbox_frame([row for row in rows if isinstance(row, dict)])
 
 
 def _parse_activities(activities_text: str) -> pd.DataFrame:
@@ -142,6 +161,10 @@ def _parse_activities(activities_text: str) -> pd.DataFrame:
     for column in numeric_columns:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
+    for column in ["bid_price_1", "ask_price_1", "mid_price", "profit_and_loss"]:
+        if column not in frame:
+            frame[column] = np.nan
+
     frame["best_bid"] = frame["bid_price_1"]
     frame["best_ask"] = frame["ask_price_1"]
     frame["spread"] = frame["best_ask"] - frame["best_bid"]
@@ -154,29 +177,24 @@ def _parse_activities(activities_text: str) -> pd.DataFrame:
         min_count=1,
     )
     frame.loc[frame["mid_price"] <= 0, "mid_price"] = np.nan
-    frame["mid_price"] = frame.groupby(["day", PRODUCT_COLUMN])["mid_price"].transform(
-        lambda series: series.ffill().bfill()
-    )
+    group_keys = ["day", PRODUCT_COLUMN] if "day" in frame else [PRODUCT_COLUMN]
+    frame["mid_price"] = frame.groupby(group_keys)["mid_price"].transform(lambda series: series.ffill().bfill())
     return frame
 
 
-def _parse_trades(trades_text: str) -> pd.DataFrame:
-    """Parse the Trade History section, tolerating trailing commas."""
+def _normalise_trades_frame(rows: Any) -> pd.DataFrame:
+    """Return standard trade columns from decoded trade rows."""
 
     columns = ["timestamp", "buyer", "seller", "symbol", "currency", "price", "quantity"]
-    if not trades_text:
+    if not isinstance(rows, list) or not rows:
         return pd.DataFrame(columns=columns)
 
-    cleaned = re.sub(r",(\s*[}\]])", r"\1", trades_text.strip())
-    try:
-        rows = json.loads(cleaned)
-    except json.JSONDecodeError:
-        rows = []
-
-    frame = pd.DataFrame(rows, columns=columns)
+    frame = pd.DataFrame([row for row in rows if isinstance(row, dict)], columns=columns)
     if frame.empty:
         return pd.DataFrame(columns=columns + ["side", "signed_quantity", "notional", "is_own_trade"])
 
+    for column in ["buyer", "seller", "symbol", "currency"]:
+        frame[column] = frame[column].fillna("").astype(str)
     frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce")
     frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
     frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce")
@@ -193,6 +211,22 @@ def _parse_trades(trades_text: str) -> pd.DataFrame:
     )
     frame["notional"] = frame["price"] * frame["quantity"]
     return frame
+
+
+def _parse_trades(trades_text: str) -> pd.DataFrame:
+    """Parse the Trade History section, tolerating trailing commas."""
+
+    columns = ["timestamp", "buyer", "seller", "symbol", "currency", "price", "quantity"]
+    if not trades_text:
+        return pd.DataFrame(columns=columns)
+
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", trades_text.strip())
+    try:
+        rows = json.loads(cleaned)
+    except json.JSONDecodeError:
+        rows = []
+
+    return _normalise_trades_frame(rows)
 
 
 ORDER_PATTERNS = [
@@ -317,7 +351,39 @@ def _parse_logged_indicators(debug_lines: pd.DataFrame, products: Iterable[str])
     return pd.DataFrame(rows, columns=columns)
 
 
-@cache_data(show_spinner=False)
+def _parse_json_envelope(text: str, source_name: str) -> ParsedBacktestLog | None:
+    """Parse newer saved-result JSON logs, returning None for old text logs."""
+
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or "activitiesLog" not in payload:
+        return None
+
+    activities = _parse_activities(str(payload.get("activitiesLog") or ""))
+    trades = _normalise_trades_frame(payload.get("tradeHistory", []))
+    sandbox = _parse_sandbox_rows(payload.get("logs", payload.get("sandboxLogs", [])))
+    debug_lines = _extract_debug_lines(sandbox)
+    products = activities[PRODUCT_COLUMN].dropna().unique().tolist() if not activities.empty else []
+    order_intents = _infer_order_intents(debug_lines, products)
+    indicators = _parse_logged_indicators(debug_lines, products)
+
+    return ParsedBacktestLog(
+        path=Path(source_name),
+        activities=activities,
+        trades=trades,
+        sandbox=sandbox,
+        debug_lines=debug_lines,
+        order_intents=order_intents,
+        indicators=indicators,
+    )
+
+
+@cache_data(show_spinner=False, max_entries=10)
 def parse_backtest_log(path: str) -> ParsedBacktestLog:
     """Parse a backtest log path into dashboard-ready DataFrames."""
 
@@ -326,9 +392,13 @@ def parse_backtest_log(path: str) -> ParsedBacktestLog:
     return parse_backtest_text(text, source_name=log_path.name)
 
 
-@cache_data(show_spinner=False)
+@cache_data(show_spinner=False, max_entries=10)
 def parse_backtest_text(text: str, source_name: str = "uploaded.log") -> ParsedBacktestLog:
     """Parse raw backtest log text into dashboard-ready DataFrames."""
+
+    envelope = _parse_json_envelope(text, source_name)
+    if envelope is not None:
+        return envelope
 
     log_path = Path(source_name)
     sandbox_text, activities_text, trades_text = _section_bounds(text)
@@ -394,6 +464,125 @@ def build_pair_spreads(activities: pd.DataFrame, window: int) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", "pair", "spread", "z_score"])
     return pd.concat(rows, ignore_index=True)
+
+
+def build_single_spread_series(
+    activities: pd.DataFrame,
+    left_product: str,
+    right_product: str,
+    window: int,
+) -> pd.DataFrame:
+    """Build one product spread and z-score series."""
+
+    columns = ["timestamp", "plot_time", "pair", "spread", "z_score"]
+    if activities.empty or not left_product or not right_product or left_product == right_product:
+        return pd.DataFrame(columns=columns)
+
+    pivot = activities.pivot_table(index=_time_keys(activities), columns=PRODUCT_COLUMN, values="mid_price", aggfunc="last")
+    if left_product not in pivot.columns or right_product not in pivot.columns:
+        return pd.DataFrame(columns=columns)
+
+    spread = pivot[left_product] - pivot[right_product]
+    rolling_mean = spread.rolling(window, min_periods=max(5, window // 5)).mean()
+    rolling_std = spread.rolling(window, min_periods=max(5, window // 5)).std().replace(0, np.nan)
+    output = spread.reset_index(name="spread")
+    output["pair"] = f"{left_product} - {right_product}"
+    output["z_score"] = ((spread - rolling_mean) / rolling_std).to_numpy()
+    output = _add_plot_time(output)
+    return output[columns]
+
+
+def _ols_beta_tstat(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Return slope and t-stat from y = intercept + slope * x."""
+
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    if len(x) < 8 or np.nanstd(x) == 0:
+        return np.nan, np.nan
+    design = np.column_stack([np.ones(len(x)), x])
+    try:
+        coefficients, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.nan, np.nan
+    residuals = y - design @ coefficients
+    dof = len(y) - design.shape[1]
+    if dof <= 0:
+        return float(coefficients[1]), np.nan
+    sigma2 = float(np.sum(residuals**2) / dof)
+    try:
+        covariance = sigma2 * np.linalg.inv(design.T @ design)
+    except np.linalg.LinAlgError:
+        return float(coefficients[1]), np.nan
+    slope_se = float(np.sqrt(covariance[1, 1])) if covariance[1, 1] >= 0 else np.nan
+    t_stat = float(coefficients[1] / slope_se) if slope_se and np.isfinite(slope_se) else np.nan
+    return float(coefficients[1]), t_stat
+
+
+def adf_proxy_p_value(series: pd.Series) -> float:
+    """Approximate rolling ADF left-tail p-value without statsmodels."""
+
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < 10:
+        return np.nan
+    y_lag = values[:-1]
+    delta = np.diff(values)
+    beta, t_stat = _ols_beta_tstat(y_lag, delta)
+    if not np.isfinite(beta) or not np.isfinite(t_stat):
+        return np.nan
+    return float(_normal_cdf(t_stat))
+
+
+def half_life_mean_reversion(series: pd.Series) -> float:
+    """Estimate OU half-life from spread increments."""
+
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < 10:
+        return np.nan
+    beta, _ = _ols_beta_tstat(values[:-1], np.diff(values))
+    if not np.isfinite(beta) or beta >= 0:
+        return np.nan
+    return float(-np.log(2) / beta)
+
+
+def hurst_exponent(series: pd.Series, max_lag: int = 20) -> float:
+    """Estimate the Hurst exponent from lagged spread differences."""
+
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < max(20, max_lag + 2):
+        return np.nan
+    max_lag = min(max_lag, len(values) // 2)
+    lags = np.arange(2, max_lag + 1)
+    tau = np.array([np.std(values[lag:] - values[:-lag]) for lag in lags], dtype=float)
+    finite = np.isfinite(tau) & (tau > 0)
+    if finite.sum() < 4:
+        return np.nan
+    slope, _ = np.polyfit(np.log(lags[finite]), np.log(tau[finite]), 1)
+    return float(slope)
+
+
+def build_spread_stationarity(
+    spread_frame: pd.DataFrame,
+    window: int,
+) -> pd.DataFrame:
+    """Build rolling stationarity diagnostics for one spread."""
+
+    columns = ["timestamp", "plot_time", "pair", "adf_p_value", "half_life", "hurst"]
+    if spread_frame.empty or "spread" not in spread_frame:
+        return pd.DataFrame(columns=columns)
+
+    output = spread_frame.sort_values("plot_time").copy()
+    rolling = output["spread"].rolling(window, min_periods=min(window, max(10, window // 3)))
+    output["adf_p_value"] = rolling.apply(adf_proxy_p_value, raw=False)
+    output["half_life"] = rolling.apply(half_life_mean_reversion, raw=False)
+    output["hurst"] = rolling.apply(hurst_exponent, raw=False)
+    for column in columns:
+        if column not in output:
+            output[column] = np.nan
+    return output[columns]
 
 
 def build_orderbook_levels(activities: pd.DataFrame, products: list[str], max_level: int = 3) -> pd.DataFrame:
@@ -671,7 +860,7 @@ def implied_volatility_call(
     strike: np.ndarray | pd.Series,
     tte: np.ndarray | pd.Series,
     max_volatility: float = 5.0,
-    iterations: int = 60,
+    iterations: int = 40,
 ) -> np.ndarray:
     """Solve zero-rate call IV with vectorized bisection."""
 
@@ -708,6 +897,7 @@ def implied_volatility_call(
     return iv
 
 
+@cache_data(show_spinner=False, max_entries=10)
 def build_options_analytics(
     activities: pd.DataFrame,
     option_products: list[str],
@@ -793,6 +983,7 @@ def _fit_method_key(method: str) -> str:
     return method.strip().lower().replace(" ", "_")
 
 
+@cache_data(show_spinner=False, max_entries=10)
 def fit_volatility_surface(
     options: pd.DataFrame,
     method: str,
@@ -851,6 +1042,17 @@ def evenly_spaced_values(values: Iterable[float | int], count: int) -> list[floa
     return [ordered[index] for index in indices]
 
 
+def nearest_value(values: Iterable[float | int], target: float | int | None) -> float | int | None:
+    """Return the available value closest to target."""
+
+    ordered = list(values)
+    if not ordered:
+        return None
+    if target is None:
+        return ordered[-1]
+    return min(ordered, key=lambda value: abs(float(value) - float(target)))
+
+
 def build_position_series(activities: pd.DataFrame, trades: pd.DataFrame, products: list[str]) -> pd.DataFrame:
     """Estimate product positions and inventory PnL from own fills and mids."""
 
@@ -886,7 +1088,7 @@ def build_position_series(activities: pd.DataFrame, trades: pd.DataFrame, produc
         flows = flows.rename(columns={"symbol": "product", "signed_quantity": "trade_flow"})
 
     grid = grid.merge(flows, on=["timestamp", "product"], how="left")
-    grid["trade_flow"] = grid["trade_flow"].fillna(0.0)
+    grid["trade_flow"] = pd.to_numeric(grid["trade_flow"], errors="coerce").fillna(0.0)
     grid = _add_plot_time(grid).sort_values(["product", "plot_time"])
     grid["position"] = grid.groupby("product")["trade_flow"].cumsum()
     grid["prev_position"] = grid.groupby("product")["position"].shift(1).fillna(0.0)
@@ -1286,6 +1488,366 @@ def build_fill_report(parsed: ParsedBacktestLog, product_filter: list[str]) -> p
     return report
 
 
+def build_iv_residual_z_scores(options: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Build rolling z-scores on IV fit residuals."""
+
+    columns = ["timestamp", "plot_time", "product", "strike_label", "iv_residual", "iv_residual_z_score"]
+    if options.empty or "iv_residual" not in options:
+        return pd.DataFrame(columns=columns)
+    output = options.sort_values(["product", "plot_time"]).copy()
+    grouped = output.groupby("product", group_keys=False)["iv_residual"]
+    rolling_mean = grouped.transform(lambda series: series.rolling(window, min_periods=max(5, window // 5)).mean())
+    rolling_std = grouped.transform(
+        lambda series: series.rolling(window, min_periods=max(5, window // 5)).std().replace(0, np.nan)
+    )
+    output["iv_residual_z_score"] = (output["iv_residual"] - rolling_mean) / rolling_std
+    for column in columns:
+        if column not in output:
+            output[column] = np.nan
+    return output[columns]
+
+
+def parse_basket_formula(formula: str, products: Iterable[str]) -> tuple[str | None, dict[str, float], str | None]:
+    """Parse formulas such as BASKET1 = 6A + 3B + 1*C."""
+
+    product_set = {str(product) for product in products}
+    text = (formula or "").strip()
+    if not text:
+        return None, {}, "Enter a basket formula."
+    if "=" not in text:
+        return None, {}, "Formula must include '='."
+
+    lhs, rhs = [part.strip() for part in text.split("=", 1)]
+    basket_product = lhs if lhs in product_set else None
+    if basket_product is None:
+        return None, {}, f"Unknown basket product: {lhs}"
+
+    weights: dict[str, float] = {}
+    normalized_rhs = rhs.replace("-", "+-")
+    for raw_term in normalized_rhs.split("+"):
+        term = raw_term.strip()
+        if not term:
+            continue
+        match = re.fullmatch(r"([+-]?\s*\d*(?:\.\d+)?)\s*\*?\s*([A-Za-z0-9_]+)", term)
+        if not match:
+            return None, {}, f"Could not parse term: {term}"
+        coefficient_text = match.group(1).replace(" ", "")
+        coefficient = float(coefficient_text) if coefficient_text not in {"", "+", "-"} else float(f"{coefficient_text}1")
+        product = match.group(2)
+        if product not in product_set:
+            return None, {}, f"Unknown component product: {product}"
+        weights[product] = weights.get(product, 0.0) + coefficient
+
+    if not weights:
+        return None, {}, "Formula has no components."
+    return basket_product, weights, None
+
+
+def build_synthetic_basket(
+    activities: pd.DataFrame,
+    basket_product: str,
+    weights: dict[str, float],
+    window: int,
+) -> pd.DataFrame:
+    """Build synthetic basket fair value, spread, and z-score."""
+
+    columns = ["timestamp", "plot_time", "basket_mid", "synthetic_mid", "spread", "z_score"]
+    if activities.empty or not basket_product or not weights:
+        return pd.DataFrame(columns=columns)
+
+    pivot = activities.pivot_table(index=_time_keys(activities), columns=PRODUCT_COLUMN, values="mid_price", aggfunc="last")
+    required = [basket_product, *weights.keys()]
+    missing = [product for product in required if product not in pivot.columns]
+    if missing:
+        return pd.DataFrame(columns=columns)
+
+    output = pivot[[basket_product, *weights.keys()]].reset_index()
+    output["basket_mid"] = output[basket_product]
+    output["synthetic_mid"] = 0.0
+    for product, coefficient in weights.items():
+        output["synthetic_mid"] += coefficient * output[product]
+    output["spread"] = output["basket_mid"] - output["synthetic_mid"]
+    rolling_mean = output["spread"].rolling(window, min_periods=max(5, window // 5)).mean()
+    rolling_std = output["spread"].rolling(window, min_periods=max(5, window // 5)).std().replace(0, np.nan)
+    output["z_score"] = (output["spread"] - rolling_mean) / rolling_std
+    output = _add_plot_time(output)
+    return output[columns]
+
+
+def build_basket_hedge_tracker(
+    activities: pd.DataFrame,
+    trades: pd.DataFrame,
+    basket_product: str,
+    weights: dict[str, float],
+    basket_position: float | None = None,
+) -> pd.DataFrame:
+    """Compare actual component inventory against basket hedge target."""
+
+    columns = ["product", "coefficient", "actual_position", "target_position", "position_gap"]
+    if not basket_product or not weights:
+        return pd.DataFrame(columns=columns)
+
+    products = [basket_product, *weights.keys()]
+    positions = build_position_series(activities, trades, products)
+    if positions.empty:
+        latest_positions = pd.Series(0.0, index=products)
+    else:
+        latest = positions.sort_values("plot_time").groupby("product", as_index=False).tail(1)
+        latest_positions = latest.set_index("product")["position"]
+
+    if basket_position is None:
+        basket_position = float(latest_positions.get(basket_product, 0.0))
+    rows = []
+    for product, coefficient in weights.items():
+        target = -basket_position * coefficient
+        actual = float(latest_positions.get(product, 0.0))
+        rows.append(
+            {
+                "product": product,
+                "coefficient": coefficient,
+                "actual_position": actual,
+                "target_position": target,
+                "position_gap": actual - target,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def parse_position_limits(text: str, products: Iterable[str], default_limit: float = DEFAULT_POSITION_LIMIT) -> dict[str, float]:
+    """Parse PRODUCT=LIMIT overrides and fill missing products with default_limit."""
+
+    limits = {str(product): float(default_limit) for product in products}
+    for raw_piece in re.split(r"[,\n]+", text or ""):
+        piece = raw_piece.strip()
+        if not piece or "=" not in piece:
+            continue
+        product, value = [part.strip() for part in piece.split("=", 1)]
+        try:
+            parsed_value = abs(float(value))
+        except ValueError:
+            continue
+        if product:
+            limits[product] = parsed_value
+    return limits
+
+
+def build_position_limit_report(
+    activities: pd.DataFrame,
+    trades: pd.DataFrame,
+    products: list[str],
+    limits: dict[str, float],
+) -> pd.DataFrame:
+    """Build latest position utilization versus configured limits."""
+
+    columns = ["product", "position", "limit", "limit_utilization", "status"]
+    positions = build_position_series(activities, trades, products)
+    rows = []
+    for product in products:
+        if positions.empty:
+            position = 0.0
+        else:
+            product_positions = positions[positions["product"].eq(product)].sort_values("plot_time")
+            position = float(product_positions["position"].iloc[-1]) if not product_positions.empty else 0.0
+        limit = float(limits.get(product, DEFAULT_POSITION_LIMIT))
+        utilization = abs(position) / limit if limit > 0 else np.nan
+        status = "red" if utilization >= 0.9 else "yellow" if utilization >= 0.7 else "green"
+        rows.append(
+            {
+                "product": product,
+                "position": position,
+                "limit": limit,
+                "limit_utilization": utilization,
+                "status": status,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_rejected_order_report(
+    order_intents: pd.DataFrame,
+    trades: pd.DataFrame,
+    products: list[str],
+    limits: dict[str, float],
+) -> pd.DataFrame:
+    """Estimate submitted orders that would breach position limits."""
+
+    columns = ["timestamp", "product", "side", "price", "quantity", "position_before", "position_after", "limit"]
+    if order_intents.empty:
+        return pd.DataFrame(columns=columns)
+
+    intents = order_intents[order_intents["product"].isin(products)].sort_values("timestamp").copy()
+    if intents.empty:
+        return pd.DataFrame(columns=columns)
+    positions = {product: 0.0 for product in products}
+    rows = []
+
+    own_fills = (
+        trades[trades["is_own_trade"] & trades["symbol"].isin(products)]
+        .groupby(["timestamp", "symbol"], as_index=False)["signed_quantity"]
+        .sum()
+        if not trades.empty
+        else pd.DataFrame(columns=["timestamp", "symbol", "signed_quantity"])
+    )
+    fills_by_timestamp = {
+        timestamp: frame for timestamp, frame in own_fills.groupby("timestamp")
+    } if not own_fills.empty else {}
+
+    for timestamp, timestamp_intents in intents.groupby("timestamp", sort=True):
+        for row in timestamp_intents.itertuples(index=False):
+            product = str(row.product)
+            signed_quantity = float(row.quantity) if row.side == "BUY" else -float(row.quantity)
+            before = positions.get(product, 0.0)
+            after = before + signed_quantity
+            limit = float(limits.get(product, DEFAULT_POSITION_LIMIT))
+            if abs(after) > limit:
+                rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "product": product,
+                        "side": row.side,
+                        "price": row.price,
+                        "quantity": row.quantity,
+                        "position_before": before,
+                        "position_after": after,
+                        "limit": limit,
+                    }
+                )
+        for fill in fills_by_timestamp.get(timestamp, pd.DataFrame()).itertuples(index=False):
+            positions[str(fill.symbol)] = positions.get(str(fill.symbol), 0.0) + float(fill.signed_quantity)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_fill_by_price_distance(parsed: ParsedBacktestLog, products: list[str]) -> pd.DataFrame:
+    """Estimate fill rate by absolute distance between submitted limit and mid."""
+
+    columns = ["product", "distance_ticks", "orders", "filled_orders", "submitted_qty", "filled_qty", "fill_rate"]
+    intents = parsed.order_intents
+    trades = parsed.trades
+    activities = parsed.activities
+    if intents.empty or activities.empty:
+        return pd.DataFrame(columns=columns)
+
+    intents = intents[intents["product"].isin(products)].copy()
+    if intents.empty:
+        return pd.DataFrame(columns=columns)
+    mids = activities[["timestamp", PRODUCT_COLUMN, "mid_price"]].rename(columns={PRODUCT_COLUMN: "product"})
+    intents = intents.merge(mids, on=["timestamp", "product"], how="left")
+    intents["distance_ticks"] = (intents["price"] - intents["mid_price"]).abs().round().astype("Int64")
+
+    if trades.empty:
+        intents["filled_quantity"] = 0.0
+    else:
+        fills = (
+            trades[trades["is_own_trade"] & trades["symbol"].isin(products)]
+            .groupby(["timestamp", "symbol", "side"], as_index=False)
+            .agg(filled_quantity=("quantity", "sum"))
+            .rename(columns={"symbol": "product"})
+        )
+        intents = intents.merge(fills, on=["timestamp", "product", "side"], how="left")
+        intents["filled_quantity"] = intents["filled_quantity"].fillna(0.0)
+    intents["filled"] = intents["filled_quantity"] > 0
+    grouped = (
+        intents.groupby(["product", "distance_ticks"], as_index=False)
+        .agg(
+            orders=("quantity", "size"),
+            filled_orders=("filled", "sum"),
+            submitted_qty=("quantity", "sum"),
+            filled_qty=("filled_quantity", "sum"),
+        )
+        .dropna(subset=["distance_ticks"])
+    )
+    grouped["fill_rate"] = grouped["filled_orders"] / grouped["orders"]
+    return grouped[columns]
+
+
+def build_runtime_report(sandbox: pd.DataFrame) -> pd.DataFrame:
+    """Build Trader.run timing from explicit runtime logs or consecutive log timestamps."""
+
+    columns = ["timestamp", "runtime_ms", "source"]
+    if sandbox.empty:
+        return pd.DataFrame(columns=columns)
+
+    frame = sandbox.sort_values("timestamp").copy()
+    runtime_values = []
+    source_values = []
+    runtime_pattern = re.compile(r"(?:runtime|elapsed|duration|wall(?:_clock)?)(?:_ms|Ms)?[=:]\s*(\d+(?:\.\d+)?)", re.I)
+    for text in frame.get("lambdaLog", pd.Series(dtype=str)).astype(str):
+        match = runtime_pattern.search(text)
+        runtime_values.append(float(match.group(1)) if match else np.nan)
+        source_values.append("logged_runtime_ms" if match else "timestamp_gap_proxy")
+    frame["runtime_ms"] = runtime_values
+    frame["source"] = source_values
+    fallback = pd.to_numeric(frame["timestamp"], errors="coerce").diff()
+    frame["runtime_ms"] = frame["runtime_ms"].fillna(fallback)
+    return frame[["timestamp", "runtime_ms", "source"]].dropna(subset=["runtime_ms"])
+
+
+def build_trader_flow(trades: pd.DataFrame, products: list[str]) -> pd.DataFrame:
+    """Build per-counterparty buy/sell flow rows."""
+
+    columns = ["timestamp", "product", "counterparty", "side", "price", "quantity", "signed_quantity"]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    subset = trades[trades["symbol"].isin(products)]
+    for row in subset.itertuples(index=False):
+        for counterparty, side, signed_quantity in [
+            (row.buyer, "BUY", row.quantity),
+            (row.seller, "SELL", -row.quantity),
+        ]:
+            if counterparty == SUBMISSION or pd.isna(counterparty):
+                continue
+            rows.append(
+                {
+                    "timestamp": row.timestamp,
+                    "product": row.symbol,
+                    "counterparty": counterparty,
+                    "side": side,
+                    "price": row.price,
+                    "quantity": row.quantity,
+                    "signed_quantity": signed_quantity,
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_conversion_report(debug_lines: pd.DataFrame) -> pd.DataFrame:
+    """Parse common conversion debug prints into a conversion PnL table."""
+
+    columns = ["timestamp", "product", "quantity", "price", "pnl", "line"]
+    if debug_lines.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    pattern = re.compile(
+        r"CONVERSION(?:\s+product=(?P<product>[A-Z0-9_]+))?"
+        r".*?(?:qty|quantity)=(?P<quantity>-?\d+(?:\.\d+)?)"
+        r"(?:.*?price=(?P<price>-?\d+(?:\.\d+)?))?"
+        r"(?:.*?pnl=(?P<pnl>-?\d+(?:\.\d+)?))?",
+        re.I,
+    )
+    for row in debug_lines.itertuples(index=False):
+        line = str(row.line)
+        match = pattern.search(line)
+        if not match:
+            continue
+        data = match.groupdict()
+        rows.append(
+            {
+                "timestamp": row.timestamp,
+                "product": data.get("product") or "UNKNOWN",
+                "quantity": float(data["quantity"]),
+                "price": float(data["price"]) if data.get("price") else np.nan,
+                "pnl": float(data["pnl"]) if data.get("pnl") else np.nan,
+                "line": line,
+            }
+        )
+    output = pd.DataFrame(rows, columns=columns)
+    if not output.empty:
+        output["cumulative_pnl"] = output["pnl"].fillna(0.0).cumsum()
+    return output
+
+
 def plot_spreads(activities: pd.DataFrame, products: list[str]) -> go.Figure:
     """Create product bid-ask spread chart."""
 
@@ -1665,7 +2227,255 @@ def plot_option_pnl_attribution(attribution: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def render_debug_log(debug_lines: pd.DataFrame, timestamp: int | None, limit: int = 200) -> None:
+def plot_iv_residual_z_scores(residuals: pd.DataFrame, entry_threshold: float, exit_threshold: float) -> go.Figure:
+    """Plot z-scores of IV residuals."""
+
+    fig = px.line(
+        residuals.dropna(subset=["iv_residual_z_score"]),
+        x="plot_time",
+        y="iv_residual_z_score",
+        color="product",
+        title="Rolling IV Residual Z-Score",
+        labels={"plot_time": "timestamp", "iv_residual_z_score": "z-score"},
+    )
+    for value, name, color in [
+        (entry_threshold, "entry", "firebrick"),
+        (-entry_threshold, "-entry", "firebrick"),
+        (exit_threshold, "exit", "gray"),
+        (-exit_threshold, "-exit", "gray"),
+    ]:
+        fig.add_hline(y=value, line_dash="dash", line_color=color, annotation_text=name)
+    return fig
+
+
+def plot_stationarity_diagnostics(diagnostics: pd.DataFrame) -> go.Figure:
+    """Plot rolling ADF proxy p-value, half-life, and Hurst exponent."""
+
+    if diagnostics.empty:
+        return go.Figure()
+    fig = go.Figure()
+    for column, name in [
+        ("adf_p_value", "ADF proxy p-value"),
+        ("half_life", "half-life"),
+        ("hurst", "Hurst"),
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=diagnostics["plot_time"],
+                y=diagnostics[column],
+                mode="lines",
+                name=name,
+            )
+        )
+    fig.add_hline(y=0.05, line_dash="dash", line_color="firebrick", annotation_text="ADF 0.05")
+    fig.add_hline(y=0.5, line_dash="dot", line_color="gray", annotation_text="Hurst 0.5")
+    fig.update_layout(
+        title="Rolling Spread Stationarity Diagnostics",
+        xaxis_title="timestamp",
+        yaxis_title="diagnostic value",
+    )
+    return fig
+
+
+def plot_spread_histogram(spread_frame: pd.DataFrame) -> go.Figure:
+    """Plot spread histogram with normal overlay."""
+
+    spread = pd.to_numeric(spread_frame.get("spread", pd.Series(dtype=float)), errors="coerce").dropna()
+    fig = go.Figure()
+    if spread.empty:
+        return fig
+    counts, bins = np.histogram(spread, bins=40)
+    centers = (bins[:-1] + bins[1:]) / 2
+    fig.add_trace(go.Bar(x=centers, y=counts, name="spread", opacity=0.7))
+    mean = float(spread.mean())
+    std = float(spread.std(ddof=1))
+    if std > 0:
+        x_grid = np.linspace(float(spread.min()), float(spread.max()), 200)
+        bin_width = float(bins[1] - bins[0])
+        y_grid = _normal_pdf((x_grid - mean) / std) / std * len(spread) * bin_width
+        fig.add_trace(go.Scatter(x=x_grid, y=y_grid, mode="lines", name="normal overlay", line={"color": "black"}))
+    fig.update_layout(title="Spread Histogram With Normal Overlay", xaxis_title="spread", yaxis_title="count")
+    return fig
+
+
+def plot_synthetic_basket(basket: pd.DataFrame) -> go.Figure:
+    """Plot basket mid against reconstructed synthetic mid."""
+
+    fig = go.Figure()
+    for column, name in [("basket_mid", "basket mid"), ("synthetic_mid", "synthetic mid")]:
+        fig.add_trace(go.Scatter(x=basket["plot_time"], y=basket[column], mode="lines", name=name))
+    fig.update_layout(title="Basket Mid Vs Synthetic Fair Value", xaxis_title="timestamp", yaxis_title="mid")
+    return fig
+
+
+def plot_basket_spread(basket: pd.DataFrame, entry_threshold: float, exit_threshold: float) -> go.Figure:
+    """Plot basket spread z-score with trading bands."""
+
+    fig = px.line(
+        basket,
+        x="plot_time",
+        y="z_score",
+        title="Basket - Synthetic Spread Z-Score",
+        labels={"plot_time": "timestamp", "z_score": "z-score"},
+    )
+    for value, name, color in [
+        (entry_threshold, "entry", "firebrick"),
+        (-entry_threshold, "-entry", "firebrick"),
+        (exit_threshold, "exit", "gray"),
+        (-exit_threshold, "-exit", "gray"),
+    ]:
+        fig.add_hline(y=value, line_dash="dash", line_color=color, annotation_text=name)
+    return fig
+
+
+def plot_position_limits(report: pd.DataFrame) -> go.Figure:
+    """Plot current position utilization."""
+
+    color_map = {"green": "seagreen", "yellow": "goldenrod", "red": "firebrick"}
+    fig = px.bar(
+        report,
+        x="product",
+        y="limit_utilization",
+        color="status",
+        color_discrete_map=color_map,
+        title="Current Position As Percent Of Limit",
+        labels={"limit_utilization": "position / limit"},
+    )
+    fig.add_hline(y=0.7, line_dash="dot", line_color="goldenrod")
+    fig.add_hline(y=0.9, line_dash="dash", line_color="firebrick")
+    return fig
+
+
+def plot_fill_by_distance(report: pd.DataFrame) -> go.Figure:
+    """Plot fill rate by distance from mid."""
+
+    fig = px.bar(
+        report,
+        x="distance_ticks",
+        y="fill_rate",
+        color="product",
+        barmode="group",
+        title="Fill Rate By Price Distance From Mid",
+        labels={"distance_ticks": "absolute ticks from mid", "fill_rate": "fill rate"},
+    )
+    return fig
+
+
+def plot_runtime_report(runtime: pd.DataFrame, threshold_ms: float) -> go.Figure:
+    """Plot Trader.run runtime or timestamp-gap proxy."""
+
+    fig = px.line(
+        runtime,
+        x="timestamp",
+        y="runtime_ms",
+        color="source",
+        title="Trader.run Runtime",
+        labels={"runtime_ms": "ms", "timestamp": "timestamp"},
+    )
+    fig.add_hline(y=threshold_ms, line_dash="dash", line_color="firebrick", annotation_text="timeout threshold")
+    fig.add_hline(y=0.8 * threshold_ms, line_dash="dot", line_color="goldenrod", annotation_text="80% threshold")
+    return fig
+
+
+def plot_trader_flow(flow: pd.DataFrame) -> go.Figure:
+    """Plot counterparty signed flow over time."""
+
+    fig = px.scatter(
+        flow,
+        x="timestamp",
+        y="price",
+        size="quantity",
+        color="counterparty",
+        symbol="side",
+        facet_col="product",
+        facet_col_wrap=3,
+        title="Trader-ID Flow By Counterparty",
+        labels={"timestamp": "timestamp", "price": "price"},
+    )
+    return fig
+
+
+def plot_parameter_sweep_heatmap(sweep: pd.DataFrame, metric: str, window: int | float | None = None) -> go.Figure:
+    """Plot entry/exit threshold sweep heatmap for one window."""
+
+    subset = sweep.copy()
+    if window is not None and "window" in subset:
+        subset = subset[subset["window"].eq(window)]
+    pivot = subset.pivot_table(index="entry_threshold", columns="exit_threshold", values=metric, aggfunc="max")
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=pivot.to_numpy(),
+            x=pivot.columns,
+            y=pivot.index,
+            colorscale="RdYlGn",
+            colorbar={"title": metric},
+        )
+    )
+    fig.update_layout(
+        title=f"Parameter Sweep Heatmap: {metric}",
+        xaxis_title="exit_threshold",
+        yaxis_title="entry_threshold",
+    )
+    return fig
+
+
+def compare_product_pnl(base: pd.DataFrame, candidate: pd.DataFrame) -> pd.DataFrame:
+    """Compare latest per-product PnL from two parsed logs."""
+
+    columns = ["product", "base_pnl", "candidate_pnl", "delta_pnl"]
+
+    def latest(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+        if frame.empty:
+            return pd.DataFrame(columns=["product", column])
+        return (
+            frame.sort_values("timestamp")
+            .groupby(PRODUCT_COLUMN, as_index=False)
+            .tail(1)[[PRODUCT_COLUMN, "profit_and_loss"]]
+            .rename(columns={PRODUCT_COLUMN: "product", "profit_and_loss": column})
+        )
+
+    output = latest(base, "base_pnl").merge(latest(candidate, "candidate_pnl"), on="product", how="outer")
+    output["delta_pnl"] = output["candidate_pnl"].fillna(0.0) - output["base_pnl"].fillna(0.0)
+    return output[columns].sort_values("delta_pnl", ascending=False)
+
+
+def plot_pnl_diff(diff: pd.DataFrame) -> go.Figure:
+    """Plot per-product PnL deltas."""
+
+    output = diff.copy()
+    output["direction"] = np.where(output["delta_pnl"] >= 0, "better", "worse")
+    fig = px.bar(
+        output,
+        x="product",
+        y="delta_pnl",
+        color="direction",
+        color_discrete_map={"better": "seagreen", "worse": "firebrick"},
+        title="Submission PnL Delta",
+        labels={"delta_pnl": "candidate - base PnL"},
+    )
+    return fig
+
+
+def plot_conversion_pnl(conversions: pd.DataFrame) -> go.Figure:
+    """Plot parsed conversion cumulative PnL."""
+
+    fig = px.line(
+        conversions,
+        x="timestamp",
+        y="cumulative_pnl",
+        color="product",
+        title="Conversion PnL Tracker",
+        labels={"cumulative_pnl": "cumulative PnL"},
+    )
+    return fig
+
+
+def render_debug_log(
+    debug_lines: pd.DataFrame,
+    timestamp: int | None,
+    limit: int = 200,
+    product_filter: list[str] | None = None,
+) -> None:
     """Render timestamp-filtered custom lambda logs."""
 
     st.subheader("Custom Trading Prints")
@@ -1676,6 +2486,9 @@ def render_debug_log(debug_lines: pd.DataFrame, timestamp: int | None, limit: in
     subset = debug_lines
     if timestamp is not None:
         subset = subset[subset["timestamp"] == timestamp]
+    if product_filter:
+        pattern = "|".join(re.escape(product) for product in product_filter)
+        subset = subset[subset["line"].astype(str).str.contains(pattern, case=False, regex=True, na=False)]
     st.dataframe(subset.tail(limit), use_container_width=True, hide_index=True)
 
 
@@ -1688,9 +2501,9 @@ def main() -> None:
     st.set_page_config(page_title="Prosperity Trading Dashboard", layout="wide")
     st.title("Prosperity Trading Dashboard")
 
-    log_files = sorted(LOG_DIR.glob("*.log"))
+    log_files = sorted([*LOG_DIR.glob("*.log"), *LOG_DIR.glob("*.txt"), *LOG_DIR.glob("*.json")])
     if not log_files:
-        st.error("No backtest logs found in backtests/*.log")
+        st.error("No backtest logs found in backtests/*.log, *.txt, or *.json")
         return
 
     with st.sidebar:
@@ -1714,11 +2527,17 @@ def main() -> None:
     with st.sidebar:
         selected_products = st.multiselect("Products", products, default=products)
         timestamps = sorted(activities["timestamp"].dropna().unique())
-        selected_timestamp = st.select_slider(
-            "Debug timestamp",
-            options=timestamps,
-            value=timestamps[-1] if timestamps else None,
-        )
+        if timestamps:
+            selected_timestamp = st.number_input(
+                "Debug timestamp",
+                min_value=int(min(timestamps)),
+                max_value=int(max(timestamps)),
+                value=int(max(timestamps)),
+                step=1,
+            )
+            selected_timestamp = nearest_value(timestamps, selected_timestamp)
+        else:
+            selected_timestamp = None
 
     if not selected_products:
         st.warning("Select at least one product.")
@@ -1756,12 +2575,8 @@ def main() -> None:
                 step=1.0,
             )
 
-    options_analytics = build_options_analytics(
-        activities,
-        option_products,
-        underlying_product,
-        option_expiry_day,
-    )
+    def current_options() -> pd.DataFrame:
+        return build_options_analytics(activities, option_products, underlying_product, option_expiry_day)
 
     latest_total_pnl = (
         activities.sort_values("timestamp").groupby(PRODUCT_COLUMN).tail(1)["profit_and_loss"].sum()
@@ -1806,47 +2621,53 @@ def main() -> None:
     with tab_volatility:
         if option_chain.empty:
             st.info("No voucher/option products detected. Expected names containing VOUCHER or OPTION with a trailing strike.")
-        elif options_analytics.empty:
-            st.warning("Select voucher products and a matching underlying to build volatility analytics.")
         else:
-            fit_method = st.selectbox("Smile fit", SMILE_FIT_METHODS)
-            fitted_options = fit_volatility_surface(options_analytics, fit_method)
-            st.plotly_chart(plot_iv_time_series(fitted_options), use_container_width=True)
+            options_analytics = current_options()
+            if options_analytics.empty:
+                st.warning("Select voucher products and a matching underlying to build volatility analytics.")
+            else:
+                fit_method = st.selectbox("Smile fit", SMILE_FIT_METHODS)
+                fitted_options = fit_volatility_surface(options_analytics, fit_method)
+                st.plotly_chart(plot_iv_time_series(downsample_by_timestamp(fitted_options, max_plot_points)), use_container_width=True)
 
-            option_times = sorted(fitted_options["plot_time"].dropna().unique())
-            if option_times:
-                default_smile_time = min(
-                    option_times,
-                    key=lambda value: abs(float(value) - float(selected_timestamp or value)),
-                )
-                smile_time = st.select_slider(
-                    "Smile timestamp",
-                    options=option_times,
-                    value=default_smile_time,
-                )
-                st.plotly_chart(
-                    plot_smile_snapshot(fitted_options, smile_time, fit_method),
-                    use_container_width=True,
-                )
+                option_times = sorted(fitted_options["plot_time"].dropna().unique())
+                if option_times:
+                    default_smile_time = nearest_value(option_times, selected_timestamp)
+                    smile_time = st.number_input(
+                        "Smile timestamp",
+                        min_value=int(min(option_times)),
+                        max_value=int(max(option_times)),
+                        value=int(default_smile_time if default_smile_time is not None else max(option_times)),
+                        step=1,
+                    )
+                    smile_time = nearest_value(option_times, smile_time)
+                    st.plotly_chart(
+                        plot_smile_snapshot(fitted_options, smile_time, fit_method),
+                        use_container_width=True,
+                    )
 
-                drift_defaults = evenly_spaced_values(option_times, 5)
-                drift_times = st.multiselect(
-                    "Smile drift timestamps",
-                    option_times,
-                    default=drift_defaults,
-                )
-                if drift_times:
-                    st.plotly_chart(plot_smile_drift(fitted_options, drift_times), use_container_width=True)
+                    drift_defaults = evenly_spaced_values(option_times, 5)
+                    drift_times = st.multiselect(
+                        "Smile drift timestamps",
+                        option_times,
+                        default=drift_defaults,
+                    )
+                    if drift_times:
+                        st.plotly_chart(plot_smile_drift(fitted_options, drift_times), use_container_width=True)
 
-            st.plotly_chart(plot_bs_price_scatter(fitted_options), use_container_width=True)
-            st.plotly_chart(plot_iv_residuals(fitted_options), use_container_width=True)
+                st.plotly_chart(plot_bs_price_scatter(downsample_by_timestamp(fitted_options, max_plot_points)), use_container_width=True)
+                st.plotly_chart(plot_iv_residuals(fitted_options), use_container_width=True)
 
     with tab_greeks:
+        options_analytics = current_options()
         if options_analytics.empty:
             st.info("No option Greek series available for the current voucher/underlying selection.")
         else:
             for greek in ["delta", "gamma", "vega", "theta"]:
-                st.plotly_chart(plot_greek_time_series(options_analytics, greek), use_container_width=True)
+                st.plotly_chart(
+                    plot_greek_time_series(downsample_by_timestamp(options_analytics, max_plot_points), greek),
+                    use_container_width=True,
+                )
 
             portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
             if portfolio_greeks.empty:
@@ -1870,7 +2691,7 @@ def main() -> None:
         option_attribution = build_option_pnl_attribution(
             activities,
             trades,
-            options_analytics,
+            current_options(),
             underlying_product,
         )
         if not option_attribution.empty:
