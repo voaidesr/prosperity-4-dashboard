@@ -487,18 +487,31 @@ def infer_option_chain(products: Iterable[str]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for product in product_list:
         upper = product.upper()
-        if "VOUCHER" not in upper and "OPTION" not in upper:
+        # Common Prosperity option name patterns: PRODUCT_VOUCHER_STRIKE, PRODUCT_OPTION_STRIKE,
+        # or abbreviations like VEV_STRIKE (Velvetfruit Extract Voucher).
+        is_option = any(term in upper for term in ["VOUCHER", "OPTION", "CALL", "PUT"])
+        if not is_option:
+            # Check for patterns like XXX_1234 or VEV_1234
+            is_option = bool(re.search(r"_[0-9]+$", product))
+
+        if not is_option:
             continue
+
         strike_match = re.search(r"(\d+(?:\.\d+)?)$", product)
         if not strike_match:
             continue
 
         strike = float(strike_match.group(1))
-        prefix = re.sub(r"_?(?:VOUCHER|OPTION|CALL|PUT).*", "", product, flags=re.IGNORECASE).strip("_")
+        prefix = re.sub(r"_?(?:VOUCHER|OPTION|CALL|PUT|\d+(?:\.\d+)?).*", "", product, flags=re.IGNORECASE).strip("_")
         underlying_candidates = [candidate for candidate in product_set if candidate != product and product.startswith(candidate)]
         underlying = prefix if prefix in product_set else ""
         if not underlying and underlying_candidates:
             underlying = max(underlying_candidates, key=len)
+        
+        # Heuristic for Round 3: VEV -> VELVETFRUIT_EXTRACT
+        if not underlying and prefix == "VEV" and "VELVETFRUIT_EXTRACT" in product_set:
+            underlying = "VELVETFRUIT_EXTRACT"
+
         rows.append({"product": product, "strike": strike, "underlying": underlying})
 
     return pd.DataFrame(rows, columns=["product", "strike", "underlying"])
@@ -629,15 +642,15 @@ def black_scholes_call_greeks(
     strike: np.ndarray | pd.Series | float,
     tte: np.ndarray | pd.Series | float,
     volatility: np.ndarray | pd.Series | float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return delta, gamma, vega, and annualized theta for zero-rate calls."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return delta, gamma, vega, annualized theta, and rho for zero-rate calls."""
 
     spot_values = np.asarray(spot, dtype=float)
     strike_values = np.asarray(strike, dtype=float)
     tte_values = np.asarray(tte, dtype=float)
     vol_values = np.asarray(volatility, dtype=float)
     valid = (spot_values > 0) & (strike_values > 0) & (tte_values > 0) & (vol_values > 0)
-    d1, _ = _bs_d1_d2(spot_values, strike_values, tte_values, vol_values)
+    d1, d2 = _bs_d1_d2(spot_values, strike_values, tte_values, vol_values)
     pdf = _normal_pdf(d1)
     sqrt_tte = np.sqrt(tte_values)
 
@@ -646,7 +659,10 @@ def black_scholes_call_greeks(
         gamma = np.where(valid, pdf / (spot_values * vol_values * sqrt_tte), np.nan)
         vega = np.where(valid, spot_values * pdf * sqrt_tte, np.nan)
         theta = np.where(valid, -(spot_values * pdf * vol_values) / (2.0 * sqrt_tte), np.nan)
-    return delta, gamma, vega, theta
+        # Rho for zero interest rate is technically T * K * N(d2) but Prosperity usually uses zero rate.
+        # We include the zero-rate limit or standard formula with r=0.
+        rho = np.where(valid, strike_values * tte_values * _normal_cdf(d2), np.nan)
+    return delta, gamma, vega, theta, rho
 
 
 def implied_volatility_call(
@@ -719,6 +735,7 @@ def build_options_analytics(
         "gamma",
         "vega",
         "theta",
+        "rho",
     ]
     if activities.empty or not option_products or underlying_product is None:
         return pd.DataFrame(columns=columns)
@@ -747,14 +764,14 @@ def build_options_analytics(
     merged = _add_plot_time(merged, ticks_per_day)
     merged["tte"] = _calculate_tte_years(merged, expiry_day, ticks_per_day, days_per_year)
     with np.errstate(divide="ignore", invalid="ignore"):
-        merged["moneyness"] = np.log(merged["strike"] / merged["underlying_price"]) / np.sqrt(merged["tte"])
+        merged["moneyness"] = np.log(merged["strike"] / merged["underlying_price"]) / (np.sqrt(merged["tte"]).replace(0, np.nan))
     merged["market_iv"] = implied_volatility_call(
         merged["market_price"],
         merged["underlying_price"],
         merged["strike"],
         merged["tte"],
     )
-    delta, gamma, vega, theta = black_scholes_call_greeks(
+    delta, gamma, vega, theta, rho = black_scholes_call_greeks(
         merged["underlying_price"],
         merged["strike"],
         merged["tte"],
@@ -764,6 +781,7 @@ def build_options_analytics(
     merged["gamma"] = gamma
     merged["vega"] = vega
     merged["theta"] = theta
+    merged["rho"] = rho
     merged["strike_label"] = "K=" + merged["strike"].map(lambda value: f"{value:g}")
     for column in columns:
         if column not in merged:
@@ -932,6 +950,7 @@ def build_portfolio_greeks(
         "portfolio_gamma",
         "portfolio_vega",
         "portfolio_theta",
+        "portfolio_rho",
         "abs_portfolio_delta",
     ]
     if activities.empty or options.empty or underlying_product is None:
@@ -954,6 +973,7 @@ def build_portfolio_greeks(
     option_positions["gamma_exposure"] = option_positions["position"] * option_positions["gamma"]
     option_positions["vega_exposure"] = option_positions["position"] * option_positions["vega"]
     option_positions["theta_exposure"] = option_positions["position"] * option_positions["theta"]
+    option_positions["rho_exposure"] = option_positions["position"] * option_positions["rho"]
 
     group_keys = [key for key in [*_time_keys(option_positions), "plot_time"] if key in option_positions.columns]
     portfolio = (
@@ -963,6 +983,7 @@ def build_portfolio_greeks(
             portfolio_gamma=("gamma_exposure", "sum"),
             portfolio_vega=("vega_exposure", "sum"),
             portfolio_theta=("theta_exposure", "sum"),
+            portfolio_rho=("rho_exposure", "sum"),
         )
         .sort_values("plot_time")
     )
@@ -996,6 +1017,9 @@ def build_option_pnl_attribution(
         "inventory_pnl",
         "spread_capture_pnl",
         "hedge_pnl",
+        "delta_pnl",
+        "gamma_pnl",
+        "vega_pnl",
         "theta_decay",
         "residual_pnl_est",
         "ending_position",
@@ -1029,25 +1053,46 @@ def build_option_pnl_attribution(
     spread_by_product = spread.set_index("product")["spread_capture_pnl"] if not spread.empty else pd.Series(dtype=float)
 
     merge_keys = [key for key in [*_time_keys(options), "product"] if key in positions.columns]
-    theta_frame = options.merge(positions[merge_keys + ["position"]], on=merge_keys, how="left")
-    theta_frame["position"] = theta_frame["position"].fillna(0.0)
-    theta_frame = theta_frame.sort_values(["product", "plot_time"])
-    theta_frame["prev_position"] = theta_frame.groupby("product")["position"].shift(1).fillna(0.0)
-    theta_frame["prev_theta"] = theta_frame.groupby("product")["theta"].shift(1)
-    theta_frame["prev_tte"] = theta_frame.groupby("product")["tte"].shift(1)
-    elapsed_years = (theta_frame["prev_tte"] - theta_frame["tte"]).clip(lower=0)
-    theta_frame["theta_decay"] = theta_frame["prev_position"] * theta_frame["prev_theta"] * elapsed_years
-    theta_by_product = theta_frame.groupby("product")["theta_decay"].sum(min_count=1)
+    attr_frame = options.merge(positions[merge_keys + ["position"]], on=merge_keys, how="left")
+    attr_frame["position"] = attr_frame["position"].fillna(0.0)
+    attr_frame = attr_frame.sort_values(["product", "plot_time"])
+    
+    attr_frame["prev_position"] = attr_frame.groupby("product")["position"].shift(1).fillna(0.0)
+    attr_frame["prev_delta"] = attr_frame.groupby("product")["delta"].shift(1)
+    attr_frame["prev_gamma"] = attr_frame.groupby("product")["gamma"].shift(1)
+    attr_frame["prev_vega"] = attr_frame.groupby("product")["vega"].shift(1)
+    attr_frame["prev_theta"] = attr_frame.groupby("product")["theta"].shift(1)
+    attr_frame["prev_tte"] = attr_frame.groupby("product")["tte"].shift(1)
+    attr_frame["prev_spot"] = attr_frame.groupby("product")["underlying_price"].shift(1)
+    attr_frame["prev_iv"] = attr_frame.groupby("product")["market_iv"].shift(1)
+    
+    delta_s = attr_frame["underlying_price"] - attr_frame["prev_spot"]
+    delta_iv = attr_frame["market_iv"] - attr_frame["prev_iv"]
+    elapsed_years = (attr_frame["prev_tte"] - attr_frame["tte"]).clip(lower=0)
+    
+    attr_frame["delta_pnl"] = attr_frame["prev_position"] * attr_frame["prev_delta"] * delta_s
+    attr_frame["gamma_pnl"] = 0.5 * attr_frame["prev_position"] * attr_frame["prev_gamma"] * (delta_s ** 2)
+    attr_frame["vega_pnl"] = attr_frame["prev_position"] * attr_frame["prev_vega"] * delta_iv
+    attr_frame["theta_decay"] = attr_frame["prev_position"] * attr_frame["prev_theta"] * elapsed_years
+    
+    sums = attr_frame.groupby("product")[["delta_pnl", "gamma_pnl", "vega_pnl", "theta_decay"]].sum(min_count=1)
 
     rows: list[dict[str, object]] = []
     for product in option_products:
         inventory_pnl = float(inventory_by_product.get(product, 0.0))
         spread_capture_pnl = float(spread_by_product.get(product, 0.0))
-        theta_decay = (
-            float(theta_by_product.get(product, 0.0)) if pd.notna(theta_by_product.get(product, np.nan)) else 0.0
-        )
+        
+        row_sums = sums.loc[product] if product in sums.index else pd.Series(0.0, index=sums.columns)
+        delta_pnl = float(row_sums["delta_pnl"]) if pd.notna(row_sums["delta_pnl"]) else 0.0
+        gamma_pnl = float(row_sums["gamma_pnl"]) if pd.notna(row_sums["gamma_pnl"]) else 0.0
+        vega_pnl = float(row_sums["vega_pnl"]) if pd.notna(row_sums["vega_pnl"]) else 0.0
+        theta_decay = float(row_sums["theta_decay"]) if pd.notna(row_sums["theta_decay"]) else 0.0
+        
         official_pnl = float(official_by_product.get(product, np.nan))
-        component_sum = inventory_pnl + spread_capture_pnl + theta_decay
+        # Note: inventory_pnl for options already includes the mid-price change.
+        # Greeks attribution is an alternative decomposition of inventory_pnl.
+        # We show them alongside each other.
+        component_sum = delta_pnl + gamma_pnl + vega_pnl + theta_decay + spread_capture_pnl
         rows.append(
             {
                 "product": product,
@@ -1056,6 +1101,9 @@ def build_option_pnl_attribution(
                 "inventory_pnl": inventory_pnl,
                 "spread_capture_pnl": spread_capture_pnl,
                 "hedge_pnl": 0.0,
+                "delta_pnl": delta_pnl,
+                "gamma_pnl": gamma_pnl,
+                "vega_pnl": vega_pnl,
                 "theta_decay": theta_decay,
                 "residual_pnl_est": official_pnl - component_sum if np.isfinite(official_pnl) else np.nan,
                 "ending_position": float(ending_position_by_product.get(product, 0.0)),
@@ -1074,6 +1122,9 @@ def build_option_pnl_attribution(
                 "inventory_pnl": 0.0,
                 "spread_capture_pnl": spread_capture_pnl,
                 "hedge_pnl": hedge_pnl,
+                "delta_pnl": 0.0,
+                "gamma_pnl": 0.0,
+                "vega_pnl": 0.0,
                 "theta_decay": 0.0,
                 "residual_pnl_est": official_pnl - spread_capture_pnl - hedge_pnl if np.isfinite(official_pnl) else np.nan,
                 "ending_position": float(ending_position_by_product.get(underlying_product, 0.0)),
@@ -1090,11 +1141,14 @@ def build_option_pnl_attribution(
         "inventory_pnl": output["inventory_pnl"].sum(),
         "spread_capture_pnl": output["spread_capture_pnl"].sum(),
         "hedge_pnl": output["hedge_pnl"].sum(),
+        "delta_pnl": output["delta_pnl"].sum(),
+        "gamma_pnl": output["gamma_pnl"].sum(),
+        "vega_pnl": output["vega_pnl"].sum(),
         "theta_decay": output["theta_decay"].sum(),
         "ending_position": np.nan,
     }
     total_component_sum = (
-        total["inventory_pnl"] + total["spread_capture_pnl"] + total["hedge_pnl"] + total["theta_decay"]
+        total["delta_pnl"] + total["gamma_pnl"] + total["vega_pnl"] + total["theta_decay"] + total["spread_capture_pnl"] + total["hedge_pnl"]
     )
     total["residual_pnl_est"] = (
         total["official_pnl"] - total_component_sum if np.isfinite(total["official_pnl"]) else np.nan
@@ -1371,15 +1425,26 @@ def plot_indicators(indicators: pd.DataFrame, labels: list[str]) -> go.Figure:
 
 
 def plot_pnl(activities: pd.DataFrame, products: list[str]) -> go.Figure:
-    """Create official product PnL chart from the activity log."""
+    """Create product and total PnL chart from the activity log."""
 
-    subset = activities[activities[PRODUCT_COLUMN].isin(products)]
+    subset = activities[activities[PRODUCT_COLUMN].isin(products)].copy()
     fig = px.line(
         subset,
         x="timestamp",
         y="profit_and_loss",
         color=PRODUCT_COLUMN,
-        title="Official Per-Product Mark-To-Market PnL",
+        title="Official Mark-To-Market PnL",
+    )
+    
+    # Add Total PnL line
+    total_pnl = subset.groupby("timestamp")["profit_and_loss"].sum().reset_index()
+    fig.add_trace(
+        go.Scatter(
+            x=total_pnl["timestamp"],
+            y=total_pnl["profit_and_loss"],
+            name="TOTAL",
+            line={"color": "black", "width": 3},
+        )
     )
     return fig
 
@@ -1533,13 +1598,13 @@ def plot_greek_time_series(options: pd.DataFrame, greek: str) -> go.Figure:
 
 
 def plot_portfolio_greeks(portfolio: pd.DataFrame) -> go.Figure:
-    """Plot aggregated portfolio delta, gamma, and vega."""
+    """Plot aggregated portfolio delta, gamma, vega, theta, and rho."""
 
     if portfolio.empty:
         return go.Figure()
     melted = portfolio.melt(
         id_vars=["plot_time"],
-        value_vars=["portfolio_delta", "portfolio_gamma", "portfolio_vega"],
+        value_vars=["portfolio_delta", "portfolio_gamma", "portfolio_vega", "portfolio_theta", "portfolio_rho"],
         var_name="greek",
         value_name="exposure",
     )
@@ -1572,11 +1637,19 @@ def plot_hedge_error(portfolio: pd.DataFrame, threshold: float) -> go.Figure:
 def plot_option_pnl_attribution(attribution: pd.DataFrame) -> go.Figure:
     """Plot options PnL attribution components by product."""
 
-    components = ["inventory_pnl", "spread_capture_pnl", "hedge_pnl", "theta_decay", "residual_pnl_est"]
+    components = [
+        "delta_pnl",
+        "gamma_pnl",
+        "vega_pnl",
+        "theta_decay",
+        "spread_capture_pnl",
+        "hedge_pnl",
+        "residual_pnl_est",
+    ]
     subset = attribution[attribution["product"].ne("TOTAL_OPTION_PORTFOLIO")].copy()
     melted = subset.melt(
         id_vars=["product", "role"],
-        value_vars=components,
+        value_vars=[c for c in components if c in subset.columns],
         var_name="component",
         value_name="pnl",
     )

@@ -195,6 +195,15 @@ def render_dashboard(parsed) -> None:
     metric_columns[2].metric("Own fills", f"{own_fill_count:,}")
     metric_columns[3].metric("Indicators", f"{len(indicators):,}")
 
+    portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
+    if not portfolio_greeks.empty:
+        latest_greeks = portfolio_greeks.tail(1).iloc[0]
+        greek_columns = st.columns(4)
+        greek_columns[0].metric("Net Delta", f"{latest_greeks['portfolio_delta']:,.2f}")
+        greek_columns[1].metric("Net Gamma", f"{latest_greeks['portfolio_gamma']:,.2f}")
+        greek_columns[2].metric("Net Vega", f"{latest_greeks['portfolio_vega']:,.2f}")
+        greek_columns[3].metric("Net Theta", f"{latest_greeks['portfolio_theta']:,.2f}")
+
     tab_market, tab_volatility, tab_greeks, tab_pnl, tab_fills, tab_indicators, tab_logs, tab_raw = st.tabs(
         ["Market", "Volatility Surface", "Greeks", "PnL", "Fill Rate", "Indicators", "Logs", "Raw Data"]
     )
@@ -264,10 +273,9 @@ def render_dashboard(parsed) -> None:
         if options_analytics.empty:
             st.info("No option Greek series available for the current voucher/underlying selection.")
         else:
-            for greek in ["delta", "gamma", "vega", "theta"]:
+            for greek in ["delta", "gamma", "vega", "theta", "rho"]:
                 st.plotly_chart(plot_greek_time_series(options_analytics, greek), use_container_width=True)
 
-            portfolio_greeks = build_portfolio_greeks(activities, options_analytics, trades, underlying_product)
             if portfolio_greeks.empty:
                 st.info("No portfolio Greek exposure available. Own-trade history may be empty.")
             else:
