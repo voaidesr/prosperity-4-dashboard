@@ -1848,6 +1848,678 @@ def build_conversion_report(debug_lines: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
+def _format_md_value(value: object) -> str:
+    """Format a scalar for markdown table cells."""
+
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            return ""
+        return f"{float(value):.6g}"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    text = str(value).replace("\n", "<br>").replace("\r", " ")
+    return text.replace("|", "\\|")
+
+
+def dataframe_to_markdown(frame: pd.DataFrame, max_rows: int = 40) -> str:
+    """Render a dataframe as a dependency-free markdown table."""
+
+    if frame is None or frame.empty:
+        return "_No rows._"
+
+    subset = frame.head(max_rows).copy()
+    subset.columns = [str(column) for column in subset.columns]
+    columns = list(subset.columns)
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] * len(columns)) + " |",
+    ]
+    for _, row in subset.iterrows():
+        lines.append("| " + " | ".join(_format_md_value(row[column]) for column in columns) + " |")
+    if len(frame) > max_rows:
+        lines.append("")
+        lines.append(f"_Showing first {max_rows:,} of {len(frame):,} rows._")
+    return "\n".join(lines)
+
+
+def _append_table(
+    parts: list[str],
+    title: str,
+    frame: pd.DataFrame,
+    columns: list[str] | None = None,
+    max_rows: int = 40,
+) -> None:
+    """Append a markdown subsection with a dataframe table."""
+
+    parts.append(f"### {title}")
+    if frame is None or frame.empty:
+        parts.append("_No rows._")
+        parts.append("")
+        return
+
+    output = frame.copy()
+    if columns is not None:
+        output = output[[column for column in columns if column in output.columns]]
+    parts.append(dataframe_to_markdown(output, max_rows=max_rows))
+    parts.append("")
+
+
+def _numeric_summary_record(label: str, series: pd.Series) -> dict[str, object]:
+    """Build a compact descriptive-statistics record for one numeric series."""
+
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        return {
+            "metric": label,
+            "count": 0,
+            "mean": np.nan,
+            "std": np.nan,
+            "min": np.nan,
+            "p05": np.nan,
+            "median": np.nan,
+            "p95": np.nan,
+            "max": np.nan,
+            "latest": np.nan,
+        }
+    return {
+        "metric": label,
+        "count": int(values.count()),
+        "mean": float(values.mean()),
+        "std": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+        "min": float(values.min()),
+        "p05": float(values.quantile(0.05)),
+        "median": float(values.median()),
+        "p95": float(values.quantile(0.95)),
+        "max": float(values.max()),
+        "latest": float(values.iloc[-1]),
+    }
+
+
+def _group_numeric_summary(
+    frame: pd.DataFrame,
+    group_column: str,
+    value_columns: list[str],
+) -> pd.DataFrame:
+    """Return grouped numeric summaries in long form."""
+
+    rows: list[dict[str, object]] = []
+    if frame is None or frame.empty or group_column not in frame:
+        return pd.DataFrame()
+    for group_value, group in frame.groupby(group_column, dropna=False):
+        for column in value_columns:
+            if column not in group:
+                continue
+            record = _numeric_summary_record(column, group[column])
+            record[group_column] = group_value
+            rows.append(record)
+    if not rows:
+        return pd.DataFrame()
+    columns = [group_column, "metric", "count", "mean", "std", "min", "p05", "median", "p95", "max", "latest"]
+    return pd.DataFrame(rows)[columns]
+
+
+def _histogram_table(series: pd.Series, bins: int = 20) -> pd.DataFrame:
+    """Return histogram counts as an AI-readable table."""
+
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        return pd.DataFrame(columns=["bin_left", "bin_right", "count"])
+    counts, edges = np.histogram(values, bins=bins)
+    return pd.DataFrame(
+        {
+            "bin_left": edges[:-1],
+            "bin_right": edges[1:],
+            "count": counts,
+        }
+    )
+
+
+def _safe_max_abs(series: pd.Series) -> float:
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(values.abs().max()) if not values.empty else np.nan
+
+
+def _latest_by_product(activities: pd.DataFrame, products: list[str]) -> pd.DataFrame:
+    if activities.empty:
+        return pd.DataFrame()
+    subset = activities[activities[PRODUCT_COLUMN].isin(products)].sort_values("timestamp")
+    if subset.empty:
+        return pd.DataFrame()
+    return subset.groupby(PRODUCT_COLUMN, as_index=False).tail(1).rename(columns={PRODUCT_COLUMN: "product"})
+
+
+def _threshold_breach_summary(
+    frame: pd.DataFrame,
+    group_column: str,
+    value_column: str,
+    threshold: float,
+) -> pd.DataFrame:
+    if frame.empty or group_column not in frame or value_column not in frame:
+        return pd.DataFrame(columns=[group_column, "observations", "entry_breaches", "entry_breach_rate", "max_abs_value"])
+    rows = []
+    for group_value, group in frame.groupby(group_column):
+        values = pd.to_numeric(group[value_column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        observations = int(values.count())
+        breaches = int((values.abs() >= threshold).sum()) if observations else 0
+        rows.append(
+            {
+                group_column: group_value,
+                "observations": observations,
+                "entry_breaches": breaches,
+                "entry_breach_rate": breaches / observations if observations else np.nan,
+                "max_abs_value": float(values.abs().max()) if observations else np.nan,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("max_abs_value", ascending=False)
+
+
+def _product_line_counts(debug_lines: pd.DataFrame, products: list[str]) -> pd.DataFrame:
+    if debug_lines.empty or not products:
+        return pd.DataFrame(columns=["product", "debug_line_count"])
+    rows = []
+    lines = debug_lines["line"].astype(str)
+    for product in products:
+        rows.append({"product": product, "debug_line_count": int(lines.str.contains(re.escape(product), case=False).sum())})
+    return pd.DataFrame(rows).sort_values("debug_line_count", ascending=False)
+
+
+def _parameter_sweep_summary(sweep: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    required = {"entry_threshold", "exit_threshold", "window", "pnl", "sharpe"}
+    if sweep is None or sweep.empty or not required.issubset(sweep.columns):
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    output = sweep.copy()
+    for column in required:
+        output[column] = pd.to_numeric(output[column], errors="coerce")
+    output = output.dropna(subset=list(required))
+    if output.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    best_rows = pd.concat(
+        [
+            output.loc[[output["pnl"].idxmax()]].assign(selection="best_pnl"),
+            output.loc[[output["sharpe"].idxmax()]].assign(selection="best_sharpe"),
+        ],
+        ignore_index=True,
+    )
+    by_window = (
+        output.groupby("window", as_index=False)
+        .agg(
+            trials=("pnl", "size"),
+            best_pnl=("pnl", "max"),
+            avg_pnl=("pnl", "mean"),
+            best_sharpe=("sharpe", "max"),
+            avg_sharpe=("sharpe", "mean"),
+        )
+        .sort_values("best_sharpe", ascending=False)
+    )
+    best_window = best_rows.loc[best_rows["selection"].eq("best_sharpe"), "window"].iloc[0]
+    heatmap = (
+        output[output["window"].eq(best_window)]
+        .pivot_table(index="entry_threshold", columns="exit_threshold", values="sharpe", aggfunc="max")
+        .reset_index()
+    )
+    heatmap.columns = [str(column) for column in heatmap.columns]
+    return best_rows, by_window, heatmap
+
+
+def build_ai_markdown_report(
+    parsed: ParsedBacktestLog,
+    activities: pd.DataFrame,
+    indicators: pd.DataFrame,
+    selected_products: list[str],
+    option_products: list[str] | None,
+    underlying_product: str | None,
+    option_expiry_day: float,
+    z_window: int,
+    entry_threshold: float,
+    exit_threshold: float,
+    delta_rebalance_threshold: float,
+    default_position_limit: float = DEFAULT_POSITION_LIMIT,
+    position_limit_overrides: str = "",
+    basket_formula: str = "",
+    stationarity_left: str | None = None,
+    stationarity_right: str | None = None,
+    stationarity_window: int | None = None,
+    comparison: ParsedBacktestLog | None = None,
+    parameter_sweep: pd.DataFrame | None = None,
+    runtime_threshold_ms: float = DEFAULT_RUNTIME_TIMEOUT_MS,
+    max_rows_per_table: int = 40,
+) -> str:
+    """Build a comprehensive markdown report from dashboard data, not chart images."""
+
+    body: list[str] = []
+    watch: list[str] = []
+    trades = parsed.trades
+    selected_products = [str(product) for product in selected_products]
+    option_products = [str(product) for product in (option_products or [])]
+    if not selected_products and not activities.empty:
+        selected_products = sorted(activities[PRODUCT_COLUMN].dropna().astype(str).unique())
+    if "z_score" not in activities.columns:
+        activities = add_rolling_z_scores(activities, z_window)
+
+    source_name = parsed.path.name if parsed.path else "uploaded_log"
+    timestamps = sorted(activities["timestamp"].dropna().unique()) if "timestamp" in activities else []
+    latest_total_pnl = (
+        activities.sort_values("timestamp").groupby(PRODUCT_COLUMN).tail(1)["profit_and_loss"].sum()
+        if not activities.empty and "profit_and_loss" in activities
+        else np.nan
+    )
+    own_fill_count = int(trades["is_own_trade"].sum()) if not trades.empty and "is_own_trade" in trades else 0
+
+    body.append("## Dataset Summary")
+    body.append(
+        "\n".join(
+            [
+                f"- Source: `{source_name}`",
+                f"- Selected products: {', '.join(selected_products) if selected_products else 'all products'}",
+                f"- Activities rows: {len(parsed.activities):,}",
+                f"- Trade rows: {len(trades):,}",
+                f"- Sandbox rows: {len(parsed.sandbox):,}",
+                f"- Debug lines: {len(parsed.debug_lines):,}",
+                f"- Indicator rows: {len(indicators):,}",
+                f"- Timestamp range: {_format_md_value(timestamps[0]) if timestamps else ''} to {_format_md_value(timestamps[-1]) if timestamps else ''}",
+                f"- Latest total PnL: {_format_md_value(latest_total_pnl)}",
+                f"- Own fills: {own_fill_count:,}",
+                f"- Rolling z-score window: {z_window}",
+                f"- Entry / exit z-score thresholds: {entry_threshold:g} / {exit_threshold:g}",
+            ]
+        )
+    )
+    body.append("")
+
+    market = activities[activities[PRODUCT_COLUMN].isin(selected_products)].copy()
+    latest_market = _latest_by_product(activities, selected_products)
+    _append_table(
+        body,
+        "Latest Market State Per Product",
+        latest_market,
+        [
+            "product",
+            "timestamp",
+            "mid_price",
+            "best_bid",
+            "best_ask",
+            "spread",
+            "profit_and_loss",
+            "z_score",
+            "quoted_bid_volume",
+            "quoted_ask_volume",
+        ],
+        max_rows_per_table,
+    )
+    if not latest_market.empty:
+        worst_pnl = latest_market.sort_values("profit_and_loss").head(3)
+        for row in worst_pnl.itertuples(index=False):
+            pnl = getattr(row, "profit_and_loss", np.nan)
+            if pd.notna(pnl) and pnl < 0:
+                watch.append(f"{row.product}: latest official PnL is negative ({pnl:.2f}).")
+
+    z_breaches = _threshold_breach_summary(market, PRODUCT_COLUMN, "z_score", entry_threshold)
+    _append_table(body, "Mid-Price Z-Score Breach Counts", z_breaches, max_rows=max_rows_per_table)
+    for row in z_breaches.head(5).itertuples(index=False):
+        if getattr(row, "entry_breaches", 0) > 0:
+            watch.append(
+                f"{getattr(row, PRODUCT_COLUMN)}: {int(row.entry_breaches)} mid-price z-score observations crossed entry threshold."
+            )
+
+    pnl_decomp = decompose_pnl(market, trades)
+    _append_table(body, "Per-Product PnL Decomposition", pnl_decomp, max_rows=max_rows_per_table)
+
+    if not trades.empty:
+        trade_summary = (
+            trades[trades["symbol"].isin(selected_products)]
+            .groupby(["symbol", "side"], as_index=False)
+            .agg(trades=("quantity", "size"), volume=("quantity", "sum"), notional=("notional", "sum"), avg_price=("price", "mean"))
+            .rename(columns={"symbol": "product"})
+            .sort_values(["product", "side"])
+        )
+    else:
+        trade_summary = pd.DataFrame()
+    _append_table(body, "Trade History Summary", trade_summary, max_rows=max_rows_per_table)
+
+    options = build_options_analytics(activities, option_products, underlying_product, option_expiry_day)
+    if options.empty:
+        body.append("## Options Analytics")
+        body.append("_No option analytics were built. Select voucher products and an underlying to populate this section._")
+        body.append("")
+    else:
+        body.append("## Options Analytics")
+        chain = infer_option_chain(activities[PRODUCT_COLUMN].dropna().unique())
+        _append_table(
+            body,
+            "Detected Option Chain",
+            chain[chain["product"].isin(option_products)],
+            ["product", "strike", "underlying"],
+            max_rows_per_table,
+        )
+        iv_stats = _group_numeric_summary(options, "product", ["market_iv", "moneyness", "market_price", "underlying_price"])
+        _append_table(body, "IV Time-Series Statistics By Voucher", iv_stats, max_rows=max_rows_per_table)
+        latest_option_time = options["plot_time"].dropna().max()
+        latest_options = options[options["plot_time"].eq(latest_option_time)].sort_values("moneyness")
+        _append_table(
+            body,
+            "Latest Option Snapshot",
+            latest_options,
+            [
+                "plot_time",
+                "product",
+                "strike",
+                "underlying_price",
+                "market_price",
+                "tte",
+                "moneyness",
+                "market_iv",
+                "delta",
+                "gamma",
+                "vega",
+                "theta",
+            ],
+            max_rows_per_table,
+        )
+
+        fit_summary_rows = []
+        residual_tables: dict[str, pd.DataFrame] = {}
+        for method in SMILE_FIT_METHODS:
+            fitted = fit_volatility_surface(options, method)
+            residual = pd.to_numeric(fitted.get("iv_residual", pd.Series(dtype=float)), errors="coerce")
+            price_error = pd.to_numeric(fitted.get("market_price", pd.Series(dtype=float)), errors="coerce") - pd.to_numeric(
+                fitted.get("theoretical_price", pd.Series(dtype=float)),
+                errors="coerce",
+            )
+            finite_residual = residual.replace([np.inf, -np.inf], np.nan).dropna()
+            finite_price_error = price_error.replace([np.inf, -np.inf], np.nan).dropna()
+            fit_summary_rows.append(
+                {
+                    "fit_method": method,
+                    "observations": int(finite_residual.count()),
+                    "mean_iv_residual": float(finite_residual.mean()) if not finite_residual.empty else np.nan,
+                    "std_iv_residual": float(finite_residual.std(ddof=1)) if len(finite_residual) > 1 else np.nan,
+                    "max_abs_iv_residual": float(finite_residual.abs().max()) if not finite_residual.empty else np.nan,
+                    "mean_price_error": float(finite_price_error.mean()) if not finite_price_error.empty else np.nan,
+                    "mae_price_error": float(finite_price_error.abs().mean()) if not finite_price_error.empty else np.nan,
+                }
+            )
+            residual_tables[method] = fitted
+        fit_summary = pd.DataFrame(fit_summary_rows).sort_values("max_abs_iv_residual")
+        _append_table(body, "Smile Fit Residual Summary", fit_summary, max_rows=max_rows_per_table)
+        if not fit_summary.empty:
+            best_method = str(fit_summary.iloc[0]["fit_method"])
+            worst_abs_residual = float(fit_summary["max_abs_iv_residual"].max())
+            if np.isfinite(worst_abs_residual) and worst_abs_residual > 0.05:
+                watch.append(f"Option smile fit has max absolute IV residual {worst_abs_residual:.4f}; inspect fit method choice.")
+        else:
+            best_method = SMILE_FIT_METHODS[0]
+
+        fitted_best = residual_tables.get(best_method, fit_volatility_surface(options, best_method))
+        snapshot = fitted_best[fitted_best["plot_time"].eq(latest_option_time)].sort_values("moneyness")
+        _append_table(
+            body,
+            f"Vol Smile Snapshot At Latest Timestamp ({best_method})",
+            snapshot,
+            ["plot_time", "product", "strike", "moneyness", "market_iv", "fitted_iv", "iv_residual", "market_price", "theoretical_price"],
+            max_rows_per_table,
+        )
+        drift_times = evenly_spaced_values(sorted(fitted_best["plot_time"].dropna().unique()), 5)
+        drift = fitted_best[fitted_best["plot_time"].isin(drift_times)].sort_values(["plot_time", "moneyness"])
+        _append_table(
+            body,
+            "Smile Drift Data At Five Timestamps",
+            drift,
+            ["plot_time", "product", "strike", "moneyness", "market_iv", "fitted_iv", "iv_residual"],
+            max_rows=max(max_rows_per_table, 60),
+        )
+        price_scatter = fitted_best.copy()
+        price_scatter["price_error"] = price_scatter["market_price"] - price_scatter["theoretical_price"]
+        price_error_summary = _group_numeric_summary(price_scatter, "product", ["price_error"])
+        _append_table(body, "BS Theoretical Vs Market Price Error Summary", price_error_summary, max_rows=max_rows_per_table)
+        _append_table(body, "IV Residual Histogram Data", _histogram_table(fitted_best["iv_residual"]), max_rows=25)
+        residual_z = build_iv_residual_z_scores(fitted_best, z_window)
+        iv_z_breaches = _threshold_breach_summary(residual_z, "product", "iv_residual_z_score", entry_threshold)
+        _append_table(body, "IV Residual Z-Score Breach Counts", iv_z_breaches, max_rows=max_rows_per_table)
+        for row in iv_z_breaches.head(5).itertuples(index=False):
+            if getattr(row, "entry_breaches", 0) > 0:
+                watch.append(f"{row.product}: {int(row.entry_breaches)} IV residual z-score observations crossed entry threshold.")
+
+    body.append("## Greeks")
+    if options.empty:
+        body.append("_No Greek series available because option analytics are empty._")
+        body.append("")
+    else:
+        greek_stats = _group_numeric_summary(options, "product", ["delta", "gamma", "vega", "theta", "rho"])
+        _append_table(body, "Per-Voucher Greek Statistics", greek_stats, max_rows=max_rows_per_table)
+        portfolio_greeks = build_portfolio_greeks(activities, options, trades, underlying_product)
+        _append_table(
+            body,
+            "Portfolio Greek Series Tail",
+            portfolio_greeks.tail(max_rows_per_table) if not portfolio_greeks.empty else portfolio_greeks,
+            max_rows=max_rows_per_table,
+        )
+        if not portfolio_greeks.empty:
+            latest_greeks = portfolio_greeks.tail(1)
+            _append_table(body, "Latest Portfolio Greek Exposure", latest_greeks, max_rows=1)
+            hedge_errors = pd.to_numeric(portfolio_greeks["abs_portfolio_delta"], errors="coerce").dropna()
+            breach_count = int((hedge_errors >= delta_rebalance_threshold).sum()) if not hedge_errors.empty else 0
+            near_zero_rate = float((hedge_errors <= max(1.0, 0.05 * delta_rebalance_threshold)).mean()) if not hedge_errors.empty else np.nan
+            body.append(
+                f"Hedge error diagnostics: {breach_count} observations above delta threshold {delta_rebalance_threshold:g}; "
+                f"near-zero hedge-error rate is {_format_md_value(near_zero_rate)}."
+            )
+            body.append("")
+            if breach_count:
+                watch.append(f"Portfolio delta exceeded rebalance threshold {breach_count} times.")
+            if np.isfinite(near_zero_rate) and near_zero_rate > 0.9 and own_fill_count > 0:
+                watch.append("Portfolio delta is near zero more than 90% of the time; check whether hedging costs are too high.")
+
+    option_attribution = build_option_pnl_attribution(activities, trades, options, underlying_product)
+    if not option_attribution.empty:
+        body.append("## Options PnL Attribution")
+        _append_table(
+            body,
+            "Inventory, Spread Capture, Hedge, And Theta Decomposition",
+            option_attribution,
+            max_rows=max_rows_per_table,
+        )
+        residual_total = option_attribution.loc[option_attribution["product"].eq("TOTAL_OPTION_PORTFOLIO"), "residual_pnl_est"]
+        if not residual_total.empty and pd.notna(residual_total.iloc[0]) and abs(float(residual_total.iloc[0])) > 100:
+            watch.append(f"Options attribution residual is large ({float(residual_total.iloc[0]):.2f}); decomposition may miss a driver.")
+
+    body.append("## Spread Stationarity")
+    if stationarity_left is None or stationarity_right is None:
+        if len(selected_products) >= 2:
+            stationarity_left, stationarity_right = selected_products[0], selected_products[1]
+    stationarity_window = stationarity_window or max(100, z_window)
+    if stationarity_left and stationarity_right and stationarity_left != stationarity_right:
+        spread_frame = build_single_spread_series(activities, stationarity_left, stationarity_right, z_window)
+        diagnostics = build_spread_stationarity(spread_frame, stationarity_window)
+        _append_table(
+            body,
+            f"Spread Series Tail ({stationarity_left} - {stationarity_right})",
+            spread_frame.tail(max_rows_per_table) if not spread_frame.empty else spread_frame,
+            max_rows=max_rows_per_table,
+        )
+        _append_table(
+            body,
+            "Rolling ADF, Half-Life, And Hurst Diagnostics Tail",
+            diagnostics.tail(max_rows_per_table) if not diagnostics.empty else diagnostics,
+            max_rows=max_rows_per_table,
+        )
+        if not spread_frame.empty:
+            spread_stats = pd.DataFrame([_numeric_summary_record("spread", spread_frame["spread"])])
+            z_stats = pd.DataFrame([_numeric_summary_record("spread_z_score", spread_frame["z_score"])])
+            _append_table(body, "Spread Summary Statistics", pd.concat([spread_stats, z_stats], ignore_index=True), max_rows=5)
+            _append_table(body, "Spread Histogram Data", _histogram_table(spread_frame["spread"]), max_rows=25)
+        latest_diag = diagnostics.dropna(subset=["adf_p_value", "half_life", "hurst"], how="all").tail(1)
+        if not latest_diag.empty:
+            row = latest_diag.iloc[0]
+            if pd.notna(row.get("adf_p_value")) and float(row["adf_p_value"]) > 0.05:
+                watch.append(f"{stationarity_left} - {stationarity_right}: latest ADF proxy p-value is above 0.05.")
+            if pd.notna(row.get("hurst")) and float(row["hurst"]) > 0.5:
+                watch.append(f"{stationarity_left} - {stationarity_right}: latest Hurst is above 0.5, suggesting trending behavior.")
+    else:
+        body.append("_Select two products to compute spread stationarity diagnostics._")
+        body.append("")
+
+    body.append("## Synthetic Basket")
+    basket_product, weights, basket_error = parse_basket_formula(basket_formula, selected_products)
+    if basket_error:
+        body.append(f"_No basket reconstruction configured: {basket_error}_")
+        body.append("")
+    else:
+        basket_frame = build_synthetic_basket(activities, basket_product, weights, z_window)
+        _append_table(
+            body,
+            f"Basket Fair-Value Reconstruction ({basket_formula})",
+            basket_frame.tail(max_rows_per_table) if not basket_frame.empty else basket_frame,
+            max_rows=max_rows_per_table,
+        )
+        basket_z = _safe_max_abs(basket_frame["z_score"]) if not basket_frame.empty else np.nan
+        if np.isfinite(basket_z) and basket_z >= entry_threshold:
+            watch.append(f"{basket_product}: basket-vs-synthetic z-score reached {basket_z:.2f}.")
+        tracker = build_basket_hedge_tracker(activities, trades, basket_product, weights)
+        _append_table(body, "Basket Hedge Ratio Tracker", tracker, max_rows=max_rows_per_table)
+
+    body.append("## Risk And Limits")
+    limits = parse_position_limits(position_limit_overrides, selected_products, default_position_limit)
+    limit_report = build_position_limit_report(activities, trades, selected_products, limits)
+    _append_table(body, "Current Position Utilization", limit_report.sort_values("limit_utilization", ascending=False), max_rows=max_rows_per_table)
+    for row in limit_report.itertuples(index=False):
+        if getattr(row, "status", "") in {"yellow", "red"}:
+            watch.append(f"{row.product}: position utilization is {float(row.limit_utilization):.1%} ({row.status}).")
+    rejected = build_rejected_order_report(parsed.order_intents, trades, selected_products, limits)
+    _append_table(body, "Orders That Would Breach Position Limits", rejected, max_rows=max_rows_per_table)
+    if not rejected.empty:
+        watch.append(f"{len(rejected):,} parsed order intents would breach configured position limits.")
+
+    body.append("## Fill Quality")
+    fill_report = build_fill_report(parsed, selected_products)
+    _append_table(body, "Fill Report", fill_report, max_rows=max_rows_per_table)
+    by_distance = build_fill_by_price_distance(parsed, selected_products)
+    _append_table(body, "Fill Rate By Price Distance From Mid", by_distance, max_rows=max_rows_per_table)
+
+    body.append("## Parameter Sweep")
+    best_sweep, sweep_by_window, sweep_heatmap = _parameter_sweep_summary(parameter_sweep if parameter_sweep is not None else pd.DataFrame())
+    if best_sweep.empty:
+        body.append("_No parameter sweep data included. Upload a CSV/JSON with entry_threshold, exit_threshold, window, pnl, sharpe in the AI Report view._")
+        body.append("")
+    else:
+        _append_table(body, "Best Parameter Sweep Rows", best_sweep, max_rows=5)
+        _append_table(body, "Parameter Sweep Summary By Window", sweep_by_window, max_rows=max_rows_per_table)
+        _append_table(body, "Sharpe Heatmap Data For Best-Sharpe Window", sweep_heatmap, max_rows=max_rows_per_table)
+
+    body.append("## Submission Diff")
+    if comparison is None:
+        body.append("_No comparison log uploaded._")
+        body.append("")
+    else:
+        diff = compare_product_pnl(comparison.activities, parsed.activities)
+        _append_table(body, "Candidate Minus Comparison PnL By Product", diff, max_rows=max_rows_per_table)
+        regressions = diff[diff["delta_pnl"] < 0].sort_values("delta_pnl")
+        if not regressions.empty:
+            watch.append(f"{len(regressions):,} products regressed versus the comparison log.")
+
+    body.append("## Runtime")
+    runtime = build_runtime_report(parsed.sandbox)
+    _append_table(body, "Trader.run Runtime Tail", runtime.tail(max_rows_per_table) if not runtime.empty else runtime, max_rows=max_rows_per_table)
+    if not runtime.empty:
+        runtime_stats = pd.DataFrame([_numeric_summary_record("runtime_ms", runtime["runtime_ms"])])
+        _append_table(body, "Runtime Summary", runtime_stats, max_rows=5)
+        high_runtime = runtime[runtime["runtime_ms"] >= 0.8 * runtime_threshold_ms]
+        _append_table(body, "Runtime Observations Above 80 Percent Timeout", high_runtime, max_rows=max_rows_per_table)
+        if not high_runtime.empty:
+            watch.append(f"{len(high_runtime):,} Trader.run observations are above 80% of the timeout threshold.")
+
+    body.append("## Trader-ID Flow")
+    flow = build_trader_flow(trades, selected_products)
+    if flow.empty:
+        body.append("_No counterparty flow available._")
+        body.append("")
+    else:
+        counterparty_summary = (
+            flow.groupby("counterparty", as_index=False)
+            .agg(
+                trades=("quantity", "size"),
+                gross_volume=("quantity", "sum"),
+                net_signed_quantity=("signed_quantity", "sum"),
+                avg_price=("price", "mean"),
+                products=("product", "nunique"),
+            )
+            .sort_values("gross_volume", ascending=False)
+        )
+        side_summary = (
+            flow.groupby(["counterparty", "product", "side"], as_index=False)
+            .agg(volume=("quantity", "sum"), trades=("quantity", "size"), avg_price=("price", "mean"))
+            .sort_values("volume", ascending=False)
+        )
+        _append_table(body, "Counterparty Flow Summary", counterparty_summary, max_rows=max_rows_per_table)
+        _append_table(body, "Counterparty Product Side Summary", side_summary, max_rows=max_rows_per_table)
+
+    body.append("## Conversions")
+    conversions = build_conversion_report(parsed.debug_lines)
+    if conversions.empty:
+        body.append("_No conversion debug prints parsed._")
+        body.append("")
+    else:
+        conversion_summary = (
+            conversions.groupby("product", as_index=False)
+            .agg(requests=("quantity", "size"), total_quantity=("quantity", "sum"), conversion_pnl=("pnl", "sum"))
+            .sort_values("conversion_pnl", ascending=False)
+        )
+        _append_table(body, "Conversion Summary", conversion_summary, max_rows=max_rows_per_table)
+        _append_table(body, "Conversion Rows", conversions, max_rows=max_rows_per_table)
+
+    body.append("## Indicators")
+    if indicators.empty:
+        body.append("_No JSON numeric indicators parsed from lambdaLog._")
+        body.append("")
+    else:
+        indicator_stats = _group_numeric_summary(indicators, "label", ["value"])
+        _append_table(body, "Logged Indicator Statistics", indicator_stats, max_rows=max_rows_per_table)
+        latest_indicators = indicators.sort_values("timestamp").groupby("label", as_index=False).tail(1)
+        _append_table(body, "Latest Indicator Values", latest_indicators.drop(columns=["source_line"], errors="ignore"), max_rows=max_rows_per_table)
+
+    body.append("## Logs")
+    sandbox_errors = parsed.sandbox[parsed.sandbox["sandboxLog"].astype(str).str.len() > 0] if not parsed.sandbox.empty else pd.DataFrame()
+    _append_table(body, "Sandbox Errors", sandbox_errors, max_rows=max_rows_per_table)
+    if not sandbox_errors.empty:
+        watch.append(f"{len(sandbox_errors):,} sandbox error rows were parsed.")
+    _append_table(body, "Debug Line Counts By Product Mention", _product_line_counts(parsed.debug_lines, selected_products), max_rows=max_rows_per_table)
+    _append_table(body, "Recent Debug Lines", parsed.debug_lines.tail(max_rows_per_table), max_rows=max_rows_per_table)
+
+    body.append("## Raw Parsed Data Shape")
+    shape_rows = pd.DataFrame(
+        [
+            {"table": "activities", "rows": len(parsed.activities), "columns": len(parsed.activities.columns)},
+            {"table": "trades", "rows": len(parsed.trades), "columns": len(parsed.trades.columns)},
+            {"table": "sandbox", "rows": len(parsed.sandbox), "columns": len(parsed.sandbox.columns)},
+            {"table": "debug_lines", "rows": len(parsed.debug_lines), "columns": len(parsed.debug_lines.columns)},
+            {"table": "order_intents", "rows": len(parsed.order_intents), "columns": len(parsed.order_intents.columns)},
+            {"table": "indicators", "rows": len(parsed.indicators), "columns": len(parsed.indicators.columns)},
+        ]
+    )
+    _append_table(body, "Parsed Table Shapes", shape_rows, max_rows=10)
+
+    header = [
+        "# Prosperity Dashboard AI Diagnostic Report",
+        "",
+        "This markdown report converts dashboard visualizations into structured data tables and diagnostics for an AI agent. It is generated from parsed log data, not chart screenshots.",
+        "",
+        "## Watchlist",
+    ]
+    if watch:
+        header.extend(f"- {item}" for item in dict.fromkeys(watch))
+    else:
+        header.append("- No automatic warning conditions were triggered by the configured thresholds.")
+    header.append("")
+    return "\n".join(header + body).strip() + "\n"
+
+
 def plot_spreads(activities: pd.DataFrame, products: list[str]) -> go.Figure:
     """Create product bid-ask spread chart."""
 

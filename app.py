@@ -22,6 +22,7 @@ from tools.dashboard import (  # noqa: E402
     SMILE_FIT_METHODS,
     add_rolling_z_scores,
     build_basket_hedge_tracker,
+    build_ai_markdown_report,
     build_conversion_report,
     build_fill_by_price_distance,
     build_option_pnl_attribution,
@@ -122,7 +123,7 @@ def validate_upload(name: str, size: int, max_upload_mb: int) -> str | None:
 
     suffix = Path(name).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
-        return "Only .log and .txt files are accepted."
+        return "Only .log, .txt, and .json files are accepted."
     if size > max_upload_mb * 1024 * 1024:
         return f"File is too large. Limit is {max_upload_mb} MB."
     return None
@@ -230,6 +231,37 @@ def render_dashboard(parsed, comparison=None) -> None:
                 step=1.0,
             )
 
+    with st.sidebar:
+        st.subheader("AI Report")
+        st.caption("Use the AI Report view for configurable basket, limits, and sweep inputs.")
+        if st.button("Build AI report", key="build_ai_report_sidebar"):
+            with st.spinner("Building AI markdown report..."):
+                st.session_state["ai_report_markdown"] = build_ai_markdown_report(
+                    parsed=parsed,
+                    activities=activities,
+                    indicators=indicators,
+                    selected_products=selected_products,
+                    option_products=option_products,
+                    underlying_product=underlying_product,
+                    option_expiry_day=option_expiry_day,
+                    z_window=z_window,
+                    entry_threshold=entry_threshold,
+                    exit_threshold=exit_threshold,
+                    delta_rebalance_threshold=delta_rebalance_threshold,
+                    runtime_threshold_ms=float(DEFAULT_RUNTIME_TIMEOUT_MS),
+                    max_rows_per_table=50,
+                )
+                st.session_state["ai_report_filename"] = f"{Path(parsed.path.name).stem or 'prosperity'}_ai_report.md"
+
+        if st.session_state.get("ai_report_markdown"):
+            st.download_button(
+                "Download AI markdown report",
+                st.session_state["ai_report_markdown"],
+                file_name=st.session_state.get("ai_report_filename", "prosperity_ai_report.md"),
+                mime="text/markdown",
+                key="download_ai_report_sidebar",
+            )
+
     def current_options() -> pd.DataFrame:
         return build_options_analytics(activities, option_products, underlying_product, option_expiry_day)
 
@@ -251,6 +283,7 @@ def render_dashboard(parsed, comparison=None) -> None:
         "Baskets",
         "Risk",
         "Fill Rate",
+        "AI Report",
         "Parameter Sweep",
         "Submission Diff",
         "Runtime",
@@ -430,6 +463,123 @@ def render_dashboard(parsed, comparison=None) -> None:
         else:
             st.plotly_chart(plot_fill_by_distance(by_distance), use_container_width=True)
             st.dataframe(by_distance, use_container_width=True, hide_index=True)
+
+    elif view == "AI Report":
+        st.subheader("AI Markdown Report")
+        st.caption(
+            "This report converts the dashboard data behind each visualization into markdown tables, "
+            "diagnostics, and threshold warnings for an AI agent."
+        )
+        report_columns = st.columns(3)
+        with report_columns[0]:
+            report_default_limit = st.number_input(
+                "Report default product limit",
+                min_value=1.0,
+                value=float(DEFAULT_POSITION_LIMIT),
+                step=1.0,
+                key="ai_report_default_limit",
+            )
+        with report_columns[1]:
+            report_stationarity_window = st.slider(
+                "Report stationarity window",
+                min_value=20,
+                max_value=1000,
+                value=max(100, z_window),
+                step=20,
+                key="ai_report_stationarity_window",
+            )
+        with report_columns[2]:
+            report_max_rows = st.slider(
+                "Max rows per report table",
+                min_value=10,
+                max_value=200,
+                value=50,
+                step=10,
+                key="ai_report_max_rows",
+            )
+
+        report_pair_columns = st.columns(2)
+        if len(selected_products) >= 2:
+            with report_pair_columns[0]:
+                report_stationarity_left = st.selectbox(
+                    "Report spread left",
+                    selected_products,
+                    index=0,
+                    key="ai_report_stationarity_left",
+                )
+            with report_pair_columns[1]:
+                report_stationarity_right = st.selectbox(
+                    "Report spread right",
+                    selected_products,
+                    index=min(1, len(selected_products) - 1),
+                    key="ai_report_stationarity_right",
+                )
+        else:
+            report_stationarity_left = selected_products[0] if selected_products else None
+            report_stationarity_right = None
+
+        report_basket_formula = st.text_input(
+            "Optional basket formula for report",
+            value="",
+            placeholder="BASKET1 = 6A + 3B + 1*C",
+            key="ai_report_basket_formula",
+        )
+        report_limit_overrides = st.text_area(
+            "Optional position limit overrides for report",
+            value="",
+            placeholder="AMETHYSTS=20, STARFRUIT=20",
+            key="ai_report_limit_overrides",
+        )
+        report_runtime_threshold = st.number_input(
+            "Report runtime timeout threshold ms",
+            min_value=1.0,
+            value=float(DEFAULT_RUNTIME_TIMEOUT_MS),
+            step=50.0,
+            key="ai_report_runtime_threshold",
+        )
+        report_sweep_file = st.file_uploader(
+            "Optional parameter sweep CSV/JSON for report",
+            type=["csv", "json"],
+            key="ai_report_parameter_sweep",
+        )
+        report_sweep = parse_parameter_sweep_upload(report_sweep_file)
+
+        with st.spinner("Building AI markdown report..."):
+            report_md = build_ai_markdown_report(
+                parsed=parsed,
+                activities=activities,
+                indicators=indicators,
+                selected_products=selected_products,
+                option_products=option_products,
+                underlying_product=underlying_product,
+                option_expiry_day=option_expiry_day,
+                z_window=z_window,
+                entry_threshold=entry_threshold,
+                exit_threshold=exit_threshold,
+                delta_rebalance_threshold=delta_rebalance_threshold,
+                default_position_limit=report_default_limit,
+                position_limit_overrides=report_limit_overrides,
+                basket_formula=report_basket_formula,
+                stationarity_left=report_stationarity_left,
+                stationarity_right=report_stationarity_right,
+                stationarity_window=report_stationarity_window,
+                comparison=comparison,
+                parameter_sweep=report_sweep,
+                runtime_threshold_ms=report_runtime_threshold,
+                max_rows_per_table=report_max_rows,
+            )
+
+        report_name = f"{Path(parsed.path.name).stem or 'prosperity'}_ai_report.md"
+        st.download_button(
+            "Download AI markdown report",
+            report_md,
+            file_name=report_name,
+            mime="text/markdown",
+        )
+        preview = report_md[:50000]
+        st.text_area("Report preview", preview, height=500)
+        if len(report_md) > len(preview):
+            st.caption(f"Preview truncated to {len(preview):,} characters. The download contains the full report.")
 
     elif view == "Parameter Sweep":
         sweep_file = st.file_uploader("Upload grid-search CSV/JSON", type=["csv", "json"], key="parameter_sweep")
